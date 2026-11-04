@@ -242,7 +242,7 @@ static void text_done(void);
 static void draw_text_page(void)
 {
     int i, x, row = 0, col = 0, y;
-    chrome(tx.prompt, "", "SEL done OCT- del OCT+ space");
+    chrome(tx.prompt, "", "SCL done OCT- del OCT+ space");
     /* the text, wrapped by character, with the cursor */
     for (i = 0; i <= wo_strlen(tx.s) && row < 5; i++) {
         y = Y0 + 4 + row * 18;
@@ -447,7 +447,7 @@ static void draw_home(void)
             lv_add(i, 8, 0, 0, "", row, i == 1 && W.has_cur ? C(TC_SIGNAL) : C(TC_TEXT), C(TC_INK));
         }
     }
-    chrome("WORKORDER", WO_BUILD " FM-1", "SELECT move  SEL open");
+    chrome("WORKORDER", WO_BUILD " FM-1", "SELECT move  SCL open");
     lv_draw(TOP.sel);
 }
 static void open_home(int i)
@@ -665,7 +665,7 @@ static void draw_session(void)
             lv_note("EDIT closes and files it.", C(TC_DIM));
         } else if (r->nhand) {
             hand = 1;
-            lv_note("Keep one card. SEL takes it, ARP deals again.", C(TC_TEXT));
+            lv_note("Keep one card. SCL takes it, ARP deals again.", C(TC_TEXT));
             for (i = 0; i < r->nhand; i++) {
                 const wo_card_t *k = &r->hand[i];
                 wo_card_label(k, lab, 24);
@@ -699,7 +699,7 @@ static void draw_session(void)
     {
         char t[24];
         wo_strcpy(t, c->is_run ? "RUN" : "SESSION", 24);
-        chrome(t, "", hand ? "SEL take  ARP deal again" : (c->is_run && c->run.ended) ? "EDIT close & file" : "SEL tick REC break LFO pause");
+        chrome(t, "", hand ? "SCL take  ARP deal again" : (c->is_run && c->run.ended) ? "EDIT close & file" : "SCL tick REC break LFO pause");
     }
     lv_draw(TOP.sel);
 }
@@ -770,7 +770,7 @@ static void draw_rate(void)
     lv_note("How did it go? Keepers teach the next rolls.", C(TC_DIM));
     for (i = 0; i < 4; i++) lv_add(i, 16, 0, 0, TOP.sel == i ? "> " : "  ", RATES[i], i == 3 ? C(TC_MAGENTA) : C(TC_TEXT), C(TC_INK));
     lv_add(4, 16, 0, 0, "Note: ", rate_note[0] ? rate_note : "(REC to write one)", C(TC_DIM), C(TC_INK));
-    chrome("CLOSE TICKET", " ", "SEL file it  REC note  HOME back");
+    chrome("CLOSE TICKET", " ", "SCL file it  REC note  HOME back");
     lv_draw(TOP.sel);
 }
 static void rate_event(uint32_t kind, uint32_t id, int32_t arg)
@@ -825,7 +825,7 @@ static int build_mode_rows(void)
 static void draw_modes(void)
 {
     build_mode_rows();
-    chrome("MODES", " ", "SEL start  EDIT its rules");
+    chrome("MODES", " ", "SCL start  EDIT its rules");
     lv_draw(TOP.sel);
 }
 static void modes_event(uint32_t kind, uint32_t id, int32_t arg)
@@ -862,7 +862,7 @@ static void draw_parked(void)
         wo_strcpy(b, "on the clock ", 64); wo_strcat(b, tb2, 64);
         lv_add(k, 24, 0, 0, "", b, C(TC_DIM), C(TC_INK));
     }
-    chrome("PARKED", " ", "SEL resume  FX discard");
+    chrome("PARKED", " ", "SCL resume  FX discard");
     lv_draw(TOP.sel);
 }
 static void parked_event(uint32_t kind, uint32_t id, int32_t arg)
@@ -904,7 +904,7 @@ static void draw_library(void)
             if (t->note[0] && TOP.sel == i) lv_add(i, 24, 0, 0, "\"", t->note, C(TC_DIMMER), C(TC_INK));
         }
     }
-    chrome("LIBRARY", " ", "SEL view  ARP reissue  FX delete");
+    chrome("LIBRARY", " ", "SCL view  ARP reissue  FX delete");
     lv_draw(TOP.sel);
 }
 static void library_event(uint32_t kind, uint32_t id, int32_t arg)
@@ -1121,7 +1121,7 @@ static void draw_gear(void)
         lv_nowrap = 1;
         lv_add(i, 8, 0, 0, W.inv[i].on ? "" : "", b, W.inv[i].on ? C(TC_TEXT) : C(TC_DIMMER), C(TC_INK));
     }
-    chrome("GEAR", " ", "EDIT on/off ALGO role SEL name");
+    chrome("GEAR", " ", "EDIT on/off ALGO role SCL name");
     lv_draw(TOP.sel);
 }
 static void gear_event(uint32_t kind, uint32_t id, int32_t arg)
@@ -1249,7 +1249,7 @@ static void draw_presets(void)
         lv_add(i, 8, 0, 0, "", tb2, TOP.sel == i ? C(TC_SIGNAL) : C(TC_TEXT), C(TC_INK));
         if (TOP.sel == i) { wo_str(WO_BUILTIN[i].desc, tb, WO_LINE); lv_add(i, 24, 0, 0, "", tb, C(TC_DIM), C(TC_INK)); }
     }
-    chrome("PRESETS", " ", "SEL use it");
+    chrome("PRESETS", " ", "SCL use it");
     lv_draw(TOP.sel);
 }
 static void presets_event(uint32_t kind, uint32_t id, int32_t arg)
@@ -1292,7 +1292,7 @@ static void setting_value(int s, char *o, int cap)
     case S_RANCHOR: wo_strcpy(o, W.set.ranchor ? "rolled" : "kept", cap); break;
     case S_SOUND: wo_strcpy(o, W.set.sound ? "on" : "off", cap); break;
     case S_VOL: wo_catu(o, W.set.volume, cap); break;
-    case S_RESETW: case S_WIPE: wo_strcpy(o, "SEL x2", cap); break;
+    case S_RESETW: case S_WIPE: wo_strcpy(o, "SCL x2", cap); break;
     case S_ABOUT: wo_strcpy(o, WO_BUILD, cap); break;
     default: break;
     }
@@ -1316,7 +1316,7 @@ static void draw_settings(void)
             lv_add(s, 24, 0, 0, "", b, C(TC_DIM), C(TC_INK));
         }
     }
-    chrome("SETTINGS", " ", "ALGO change  SEL toggle");
+    chrome("SETTINGS", " ", "ALGO change  SCL toggle");
     lv_draw(TOP.sel);
 }
 static void settings_change(int s, int d)
@@ -1356,11 +1356,11 @@ static void settings_event(uint32_t kind, uint32_t id, int32_t arg)
 
 /* ================================================================ HELP */
 static const char *const HELP[] = {
-    "Everywhere", "HOME goes back. Hold it to leave WORKORDER. SELECT moves, SEL opens. GLO explains the terms in a line. PLAY loops the rolled chords. The keys play the rolled scale; OCT-/OCT+ shift them.",
+    "Everywhere", "HOME goes back. Hold it to leave WORKORDER. SELECT moves, SCL opens. GLO explains the terms in a line. PLAY loops the rolled chords. The keys play the rolled scale; OCT-/OCT+ shift them.",
     "Roll", "ALGO severity, KNOB1 lines, KNOB2 mixed severity. EDIT switches a parameter on/off, SAVE holds it. REC rolls all, ARP rolls one, SEQ mutates, FX rolls at random. LFO issues the ticket.",
-    "Session", "SEL ticks a rule off, REC breaks it (say why), ARP unbreaks it, FX retires a rule from the pool for good. LFO pauses the clock, SAVE parks the ticket, EDIT closes and files it.",
-    "The Run", "Each round deals cards: SEL keeps one, ARP deals again. Tick it off to reach the next round. A broken brutal card costs two lives.",
-    "Typing", "White keys are A to P, black keys Q to Z, the top black key is a full stop. OCT- deletes, OCT+ is a space, EDIT capitals, KNOB1 and FX add a sign. SEL finishes.",
+    "Session", "SCL ticks a rule off, REC breaks it (say why), ARP unbreaks it, FX retires a rule from the pool for good. LFO pauses the clock, SAVE parks the ticket, EDIT closes and files it.",
+    "The Run", "Each round deals cards: SCL keeps one, ARP deals again. Tick it off to reach the next round. A broken brutal card costs two lives.",
+    "Typing", "White keys are A to P, black keys Q to Z, the top black key is a full stop. OCT- deletes, OCT+ is a space, EDIT capitals, KNOB1 and FX add a sign. SCL finishes.",
     "Scores", "Points drop the longer a ticket takes. Brutal counts 3.5x, firm 2x. Modes multiply. Keeper tickets teach the next rolls.",
 };
 static void draw_help(void)
