@@ -302,7 +302,7 @@ static void draw_text_page(void)
         if (tx.s[i]) { char b[2] = {tx.s[i], 0}; d_text(3 + col * CW, y, b, C(TC_TEXT)); }
         if (++col >= 39) { col = 0; row++; }
     }
-    d_text(3, 104, "OCT- delete  OCT+ space  KNOB1 picks sign", C(TC_DIMMER));
+    d_text(3, 104, "OCT- delete  OCT+ space  KNOB1 sign", C(TC_DIMMER));
     y = 120;
     for (i = 0; i < 16; i++) {
         char b[2] = {(char)(key_char(WHITE[i]) - 32), 0};
