@@ -38,6 +38,8 @@ jobs:
       - name: The package on the branch "builds" too
         run: |
           mkdir -p /tmp/out && cp build/workorder.fwsc build/workorder.syms build/workorder.bin /tmp/out/ 2>/dev/null || true
+          cp build/modules/workorder.* build/*.dis /tmp/out/ 2>/dev/null || true
+          ls -la build build/modules > /tmp/out/LISTING.txt 2>&1 || true
           cd /tmp/out
           git init -q -b builds
           git config user.name "github-actions[bot]"
