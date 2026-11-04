@@ -1,11 +1,21 @@
 /* SPDX-License-Identifier: GPL-3.0-only */
-/* The FM-1's screens: 240 x 240, the 16 px Terminus font (30 columns), drawn into 240 x 80 strips.
- * Every page lists what you can do with it on its bottom line. */
+/* The FM-1's screens: 240 x 240 in a 6 x 10 font (40 columns, 18 rows of content), drawn into
+ * 240 x 80 strips. The bottom of every page is a grid laid out like the panel's two rows of
+ * buttons (FX SCL ENV LFO EDIT GLO / HOME SAVE ARP SEQ PLAY REC), naming what each one does here.
+ *
+ * One kind of action per button, on every page:
+ *   SCL open / tick / confirm      HOME back                 GLO explain the terms
+ *   PLAY start the ticket (no ticket: roll and start in one press), pause / resume; hold: finish
+ *   REC  make new: roll, deal again, add      ARP  reroll the selected one    SEQ  mutate
+ *   LFO  random                               EDIT on / off, edit             SAVE hold, park
+ *   FX   break; hold: retire / delete         ENV  hear the chords
+ * Anything that can't be undone needs a hold (0.8 s), and the grid shows it while you hold. */
 #include "hb_module.h"
 #include "wo.h"
 #include "wo_store.h"
 #include "wo_synth.h"
 #include "wo_ui.h"
+#include "wo_font.h"
 
 static const hb_host_t *H;
 
@@ -17,10 +27,21 @@ static uint16_t tier_col(uint8_t t)
 }
 static const char TIERCH[3] = {'G', 'F', 'B'};
 
+/* ================================================================ geometry */
+#define CW 6                    /* a character */
+#define CH 10
+#define HDR_H 12                /* the header: 0..11, its rule at 12 */
+#define Y0 14                   /* the first content row */
+#define ROWH 11
+#define NROWS 18                /* 14 + 18 * 11 = 212 */
+#define GRID_Y 214              /* the button grid: two rows of 13 px, its rule at 213 */
+#define GRID_RH 13
+#define COLS 40
+
 /* ================================================================ the draw list */
-#define NOPS 300
+#define NOPS 320
 #define TPOOL 9000
-typedef struct { int16_t x, y, w, h; uint16_t c; int16_t s; uint8_t big; } op_t;
+typedef struct { int16_t x, y, w, h; uint16_t c; int16_t s; } op_t;
 static op_t ops[NOPS];
 static int nops, tpos;
 static char tpool[TPOOL];
@@ -29,19 +50,37 @@ static void d_rect(int x, int y, int w, int h, uint16_t c)
 {
     if (nops >= NOPS) return;
     ops[nops].x = (int16_t)x; ops[nops].y = (int16_t)y; ops[nops].w = (int16_t)w; ops[nops].h = (int16_t)h;
-    ops[nops].c = c; ops[nops].s = -1; ops[nops].big = 0; nops++;
+    ops[nops].c = c; ops[nops].s = -1; nops++;
 }
-static void d_text(int x, int y, const char *s, uint16_t c, int big)
+static void d_text(int x, int y, const char *s, uint16_t c)
 {
     int n = wo_strlen(s);
     if (nops >= NOPS || tpos + n + 1 > TPOOL || !n) return;
     wo_strcpy(tpool + tpos, s, n + 1);
-    ops[nops].x = (int16_t)x; ops[nops].y = (int16_t)y; ops[nops].w = (int16_t)(n * (big ? 16 : 8));
-    ops[nops].h = (int16_t)(big ? 32 : 16);
-    ops[nops].c = c; ops[nops].s = (int16_t)tpos; ops[nops].big = (uint8_t)big; nops++;
+    ops[nops].x = (int16_t)x; ops[nops].y = (int16_t)y; ops[nops].w = (int16_t)(n * CW); ops[nops].h = CH;
+    ops[nops].c = c; ops[nops].s = (int16_t)tpos; nops++;
     tpos += n + 1;
 }
-static void d_text_r(int xr, int y, const char *s, uint16_t c) { d_text(xr - wo_strlen(s) * 8, y, s, c, 0); }
+static void d_text_r(int xr, int y, const char *s, uint16_t c) { d_text(xr - wo_strlen(s) * CW, y, s, c); }
+
+/* the font's pixels into the host's canvas */
+static void glyphs(int x, int y, const char *s, uint16_t c, int y0, int h)
+{
+    for (; *s; s++, x += CW) {
+        uint8_t ch = (uint8_t)*s;
+        const uint8_t *g;
+        int r;
+        if (ch < 32 || ch > 126) ch = '?';
+        if (ch == ' ') continue;
+        g = WO_FONT + (ch - 32) * CH;
+        for (r = 0; r < CH; r++) {
+            int yy = y + r, b;
+            uint8_t bits = g[r];
+            if (yy < y0 || yy >= y0 + h || !bits) continue;
+            for (b = 0; b < CW; b++) if (bits & (0x80u >> b)) H->cv_pixel(x + b, yy - y0, c);
+        }
+    }
+}
 
 #define STRIP 80
 static void flush_rows(int y0, int y1)
@@ -54,7 +93,7 @@ static void flush_rows(int y0, int y1)
             op_t *o = &ops[i];
             if (o->y + o->h <= sy || o->y >= sy + h) continue;
             if (o->s < 0) H->cv_rect(o->x, o->y - sy, o->w, o->h, o->c);
-            else H->cv_text(o->x, o->y - sy, o->big, tpool + o->s, o->c);
+            else glyphs(o->x, o->y, tpool + o->s, o->c, sy, h);
         }
         H->cv_blit(0, sy);
     }
@@ -62,7 +101,7 @@ static void flush_rows(int y0, int y1)
 
 /* ================================================================ pages */
 enum { PG_HOME, PG_ROLL, PG_FIELD, PG_SESSION, PG_RATE, PG_MODES, PG_PARKED, PG_LIBRARY, PG_VIEW, PG_SCORES,
-       PG_RULES, PG_GEAR, PG_BUCKETS, PG_MATS, PG_PRESETS, PG_SETTINGS, PG_HELP, PG_GLOSS, PG_TEXT, PG_CONF };
+       PG_RULES, PG_GEAR, PG_BUCKETS, PG_MATS, PG_PRESETS, PG_SETTINGS, PG_HELP, PG_GLOSS, PG_TEXT, PG_N };
 typedef struct { uint8_t page; int16_t sel; int16_t scroll; int16_t arg; } frame_t;
 static frame_t st[10];
 static int depth;
@@ -70,54 +109,48 @@ static int depth;
 
 static char toast_s[48];
 static uint32_t toast_until;
-static uint32_t confirm_at; static int confirm_what = -1;
-static uint32_t home_down;
 static int need_full = 1;
 static uint32_t last_clock_s = 0xFFFFFFFFu;
+
+/* a button held down: tap on release, the hold action once it has been down 0.8 s */
+#define HOLD_MS 800u
+#define EV_HOLD 0x0A000000u
+static int held_btn = -1, held_fired;
+static uint32_t held_t0;
 
 static void toast(const char *s) { wo_strcpy(toast_s, s, 48); toast_until = H->ms() + 1800u; need_full = 1; }
 static void push(uint8_t p, int16_t arg) { if (depth < 9) depth++; st[depth].page = p; st[depth].sel = 0; st[depth].scroll = 0; st[depth].arg = arg; need_full = 1; }
 static void pop(void) { if (depth > 0) depth--; need_full = 1; }
 static void go_root(uint8_t p) { depth = 0; st[0].page = PG_HOME; st[0].sel = 0; st[0].scroll = 0; if (p != PG_HOME) push(p, 0); }
-static int confirm(int what)          /* the same destructive press twice within 2 s */
-{
-    uint32_t t = H->ms();
-    if (confirm_what == what && t - confirm_at < 2000u) { confirm_what = -1; return 1; }
-    confirm_what = what; confirm_at = t;
-    toast("Press again to confirm");
-    return 0;
-}
 
 /* ================================================================ the list view */
-#define ROWH 17
-#define Y0 19
-#define NROWS 12
-#define MAXROWS 220
-typedef struct { char t[31]; uint16_t fg, bg; int16_t entry; uint8_t x; char badge; uint16_t bcol; } row_t;
+#define MAXROWS 240
+typedef struct { char t[COLS + 1]; uint16_t fg, bg; int16_t entry; uint8_t x; char badge; uint16_t bcol; } row_t;
 static row_t rows[MAXROWS];
 static int nrows;
 static int lv_nowrap;                   /* the next lv_add: one row, cut short with a '.' */
 
 static void lv_reset(void) { nrows = 0; }
 
-/* wrapped into rows of up to 30 columns; continuation rows hang under the text, past the prefix */
+/* wrapped into rows; continuation rows hang under the text, past the prefix */
 static void lv_add(int entry, int indent, char badge, uint16_t bcol, const char *pre, const char *text, uint16_t fg, uint16_t bg)
 {
-    int x0 = indent + (badge ? 12 : 0), cols = (236 - x0) / 8, plen = wo_strlen(pre), pos = 0, first = 1;
+    int x0 = indent + (badge ? 9 : 0), cols = (238 - x0) / CW, plen = wo_strlen(pre), pos = 0, first = 1;
     int tl = wo_strlen(text);
     if (cols < 4) cols = 4;
+    if (cols > COLS) cols = COLS;
     do {
         row_t *r;
         int room = cols - (first ? plen : (plen > 4 ? 2 : plen)), n, cut, k = 0;
-        if (nrows >= MAXROWS) return;
+        if (nrows >= MAXROWS) break;
         r = &rows[nrows++];
         r->fg = fg; r->bg = bg; r->entry = (int16_t)entry; r->x = (uint8_t)x0;
         r->badge = first ? badge : 0; r->bcol = bcol;
-        if (first) { for (k = 0; k < plen && k < 30; k++) r->t[k] = pre[k]; }
+        if (first) { for (k = 0; k < plen && k < COLS; k++) r->t[k] = pre[k]; }
         else { int pad = plen > 4 ? 2 : plen; for (k = 0; k < pad; k++) r->t[k] = ' '; }
         while (text[pos] == ' ' && !first) pos++;
         n = tl - pos;
-        if (n > room && lv_nowrap) { n = room; }
+        if (n > room && lv_nowrap) n = room;
         else if (n > room) {
             cut = room;
             while (cut > 0 && text[pos + cut] != ' ' && text[pos + cut - 1] != '_') cut--;
@@ -125,10 +158,7 @@ static void lv_add(int entry, int indent, char badge, uint16_t bcol, const char 
             n = cut;
         }
         if (n < 0) n = 0;
-        {
-            int q;
-            for (q = 0; q < n && k < 30; q++) r->t[k++] = text[pos + q];
-        }
+        { int q; for (q = 0; q < n && k < COLS; q++) r->t[k++] = text[pos + q]; }
         r->t[k] = 0;
         pos += n;
         first = 0;
@@ -136,7 +166,7 @@ static void lv_add(int entry, int indent, char badge, uint16_t bcol, const char 
     } while (pos < tl);
     lv_nowrap = 0;
 }
-static void lv_note(const char *text, uint16_t fg) { lv_add(-1, 4, 0, 0, "", text, fg, C(TC_INK)); }
+static void lv_note(const char *text, uint16_t fg) { lv_add(-1, 3, 0, 0, "", text, fg, C(TC_INK)); }
 
 /* draw the rows so the selected entry is in view */
 static void lv_draw(int sel)
@@ -147,9 +177,7 @@ static void lv_draw(int sel)
         if (first < s) s = first;
         if (last >= s + NROWS) s = last - NROWS + 1;
         if (first < s) s = first;
-        if (first == 0 || (s > 0 && rows[s - 1].entry < 0 && first == s)) {   /* show notes above the first entry */
-            while (s > 0 && rows[s - 1].entry < 0 && last - (s - 1) < NROWS) s--;
-        }
+        while (s > 0 && rows[s - 1].entry < 0 && last - (s - 1) < NROWS) s--;   /* notes above the entry, if they fit */
     }
     if (s > nrows - NROWS) s = nrows - NROWS;
     if (s < 0) s = 0;
@@ -159,17 +187,16 @@ static void lv_draw(int sel)
         int on = sel >= 0 && r->entry == sel;
         uint16_t bg = on ? C(TC_INK3) : r->bg;
         if (bg != C(TC_INK)) d_rect(0, y - 1, 240, ROWH, bg);
-        if (on) d_rect(0, y - 1, 3, ROWH, C(TC_SIGNAL));
-        if (r->badge) { d_rect(r->x - 12, y + 1, 10, 13, r->bcol); { char b[2] = {r->badge, 0}; d_text(r->x - 11, y, b, C(TC_ONACC), 0); } }
-        d_text(r->x, y, r->t, r->fg, 0);
+        if (on) d_rect(0, y - 1, 2, ROWH, C(TC_SIGNAL));
+        if (r->badge) { char b[2] = {r->badge, 0}; d_rect(r->x - 9, y, 7, CH, r->bcol); d_text(r->x - 9 + 1, y, b, C(TC_ONACC)); }
+        d_text(r->x, y, r->t, r->fg);
     }
     if (nrows > NROWS) {                    /* a scroll mark on the right */
-        int h = 204 * NROWS / nrows, top = 204 * s / nrows;
-        d_rect(237, Y0 + top, 3, h < 6 ? 6 : h, C(TC_RULE2));
+        int hh = NROWS * ROWH, bh = hh * NROWS / nrows, top = hh * s / nrows;
+        d_rect(238, Y0 - 1 + top, 2, bh < 5 ? 5 : bh, C(TC_RULE2));
     }
 }
 
-/* how many entries the page's list holds, for moving the selection */
 static int lv_entries(void)
 {
     int i, m = -1;
@@ -178,25 +205,48 @@ static int lv_entries(void)
 }
 static int lv_has(int e) { int i; for (i = 0; i < nrows; i++) if (rows[i].entry == e) return 1; return 0; }
 
+/* ================================================================ the button grid */
+/* index = button id - 2: FX SCL ENV LFO EDIT GLO, then HOME SAVE ARP SEQ PLAY REC */
+static const char *key_tap[12], *key_hold[12];
+static void keys_clear(void) { int i; for (i = 0; i < 12; i++) key_tap[i] = key_hold[i] = 0; }
+static void K(int btn, const char *tap, const char *hold) { key_tap[btn - 2] = tap; key_hold[btn - 2] = hold; }
+
+static void draw_grid(void)
+{
+    int i;
+    d_rect(0, GRID_Y - 1, 240, 1, C(TC_RULE2));
+    d_rect(0, GRID_Y, 240, 240 - GRID_Y, C(TC_INK2));
+    for (i = 0; i < 12; i++) {
+        int x = (i % 6) * 40, y = GRID_Y + (i / 6) * GRID_RH;
+        int holding = held_btn == i + 2;
+        const char *t = holding && key_hold[i] ? key_hold[i] : key_tap[i];
+        if (!t || !t[0]) continue;
+        d_rect(x + 1, y + 1, 38, GRID_RH - 1, holding ? C(TC_SIGNAL) : C(TC_INK3));
+        if (key_hold[i] && !holding) d_rect(x + 36, y + 2, 2, 2, C(TC_SIGNAL));   /* a hold does more */
+        d_text(x + 20 - wo_strlen(t) * CW / 2, y + 2, t, holding ? C(TC_ONACC) : C(TC_TEXT));
+    }
+}
+
 /* ================================================================ chrome */
-static void chrome(const char *title, const char *right, const char *hint)
+static void chrome(const char *title, const char *right)
 {
     char clk[16];
-    d_rect(0, 0, 240, 18, C(TC_INK2));
-    d_rect(0, 18, 240, 1, C(TC_RULE2));
-    d_text(4, 1, title, C(TC_SIGNAL), 0);
-    if (right && right[0]) d_text_r(236, 1, right, C(TC_DIM));
+    d_rect(0, 0, 240, HDR_H, C(TC_INK2));
+    d_rect(0, HDR_H, 240, 1, C(TC_RULE2));
+    if (toast_until && H->ms() < toast_until) d_text(3, 1, toast_s, C(TC_SIGNAL));
+    else d_text(3, 1, title, C(TC_SIGNAL));
+    if (right && right[0]) d_text_r(237, 1, right, C(TC_DIM));
     else if (W.has_cur) {
         uint32_t e = wo_elapsed(&W.cur);
         if (W.cur.limit_ms) wo_hhmmss(clk, W.cur.limit_ms > e ? W.cur.limit_ms - e : 0, 16);
         else wo_hhmmss(clk, e, 16);
-        d_text_r(236, 1, clk, W.cur.running ? C(TC_TEXT) : C(TC_DIMMER));
+        if (!W.cur.running) wo_strcat(clk, " ||", 16);
+        d_text_r(237, 1, clk, W.cur.running ? C(TC_TEXT) : C(TC_DIMMER));
     }
-    d_rect(0, 222, 240, 1, C(TC_RULE));
-    d_rect(0, 223, 240, 17, C(TC_INK2));
-    if (toast_until && H->ms() < toast_until) d_text(4, 223, toast_s, C(TC_SIGNAL), 0);
-    else d_text(4, 223, hint, C(TC_DIM), 0);
+    draw_grid();
 }
+
+static void upcase(char *s) { for (; *s; s++) if (*s >= 'a' && *s <= 'z') *s = (char)(*s - 32); }
 
 /* ================================================================ text entry */
 enum { TX_BREAK, TX_RETIRE, TX_NOTE, TX_CUSTOM_NEW, TX_CUSTOM_EDIT, TX_INV_NEW, TX_INV_RENAME, TX_MAT_NEW };
@@ -225,12 +275,11 @@ static void text_begin(uint8_t purpose, int arg, int arg2, const char *prompt, c
 
 static void text_insert(char ch)
 {
-    int n = wo_strlen(tx.s), i;
+    int n = wo_strlen(tx.s), i, name = tx.purpose == TX_INV_NEW || tx.purpose == TX_INV_RENAME;
     if (n >= tx.cap - 1) return;
     if (ch >= 'a' && ch <= 'z') {
         int auto_cap = tx.cur == 0 || (tx.cur >= 2 && tx.s[tx.cur - 1] == ' ' && (tx.s[tx.cur - 2] == '.' || tx.s[tx.cur - 2] == '?' || tx.s[tx.cur - 2] == '!'));
-        if (tx.shift || (auto_cap && tx.purpose != TX_INV_NEW && tx.purpose != TX_INV_RENAME)) ch = (char)(ch - 32);
-        if ((tx.purpose == TX_INV_NEW || tx.purpose == TX_INV_RENAME) && tx.cur == 0) ch = (char)(ch >= 'a' ? ch - 32 : ch);
+        if (tx.shift || auto_cap || (name && tx.cur && tx.s[tx.cur - 1] == ' ')) ch = (char)(ch - 32);
         tx.shift = 0;
     }
     for (i = n + 1; i > tx.cur; i--) tx.s[i] = tx.s[i - 1];
@@ -242,38 +291,32 @@ static void text_done(void);
 static void draw_text_page(void)
 {
     int i, x, row = 0, col = 0, y;
-    chrome(tx.prompt, "", "SCL done OCT- del OCT+ space");
-    /* the text, wrapped by character, with the cursor */
-    for (i = 0; i <= wo_strlen(tx.s) && row < 5; i++) {
-        y = Y0 + 4 + row * 18;
-        if (i == tx.cur) d_rect(4 + col * 8, y + 15, 8, 2, C(TC_SIGNAL));
-        if (tx.s[i]) { char b[2] = {tx.s[i], 0}; d_text(4 + col * 8, y, b, C(TC_TEXT), 0); }
-        if (++col >= 29) { col = 0; row++; }
+    keys_clear();
+    K(HB_BTN_SEL, "done", 0); K(HB_BTN_HOME, "cancel", 0); K(HB_BTN_EDIT, tx.shift ? "CAPS" : "caps", 0);
+    { static char sym[8]; sym[0] = '"'; sym[1] = SYMS[tx.sym]; sym[2] = '"'; sym[3] = 0; K(HB_BTN_FX, sym, 0); }
+    chrome("TYPING", " ");
+    d_text(3, Y0, tx.prompt, C(TC_SIGNAL));
+    for (i = 0; i <= wo_strlen(tx.s) && row < 7; i++) {
+        y = Y0 + 2 + (row + 1) * ROWH;
+        if (i == tx.cur) d_rect(3 + col * CW, y + CH, CW, 1, C(TC_SIGNAL));
+        if (tx.s[i]) { char b[2] = {tx.s[i], 0}; d_text(3 + col * CW, y, b, C(TC_TEXT)); }
+        if (++col >= 39) { col = 0; row++; }
     }
-    y = 118;
-    {
-        char b[40];
-        wo_strcpy(b, "FX inserts: ", 40);
-        { char c2[2] = {SYMS[tx.sym], 0}; wo_strcat(b, c2, 40); }
-        wo_strcat(b, "  (KNOB1)", 40);
-        if (tx.shift) wo_strcat(b, "  EDIT:CAPS", 40);
-        d_text(4, y, b, C(TC_DIM), 0);
-    }
-    /* the keyboard as letters */
-    y = 140;
+    d_text(3, 104, "OCT- delete  OCT+ space  KNOB1 picks sign", C(TC_DIMMER));
+    y = 120;
     for (i = 0; i < 16; i++) {
         char b[2] = {(char)(key_char(WHITE[i]) - 32), 0};
         x = i * 15;
-        d_rect(x, y, 14, 80, C(TC_TEXT));
-        d_text(x + 3, y + 62, b, C(TC_INK), 0);
+        d_rect(x, y, 14, 90, C(TC_TEXT));
+        d_text(x + 4, y + 78, b, C(TC_INK));
     }
     for (i = 0; i < 27; i++) {
         int w = 0, j, wi = 0;
         for (j = 0; j < 16; j++) { if (WHITE[j] == i) w = 1; if (WHITE[j] < i) wi = j + 1; }
         if (w) continue;
         x = wi * 15 - 5;
-        d_rect(x, y, 10, 46, C(TC_INK2));
-        { char b[2] = {key_char(i) == '.' ? '.' : (char)(key_char(i) - 32), 0}; d_text(x + 1, y + 28, b, C(TC_SIGNAL), 0); }
+        d_rect(x, y, 10, 52, C(TC_INK2));
+        { char b[2] = {key_char(i) == '.' ? '.' : (char)(key_char(i) - 32), 0}; d_text(x + 2, y + 38, b, C(TC_SIGNAL)); }
     }
 }
 
@@ -282,10 +325,7 @@ static void text_event(uint32_t kind, uint32_t id, int32_t arg)
     if (kind == HB_EV_KEY_DOWN) { text_insert(key_char((int)id)); return; }
     if (kind == HB_EV_ENC) {
         if (id == HB_ENC_SELECT) { tx.cur += arg; if (tx.cur < 0) tx.cur = 0; if (tx.cur > wo_strlen(tx.s)) tx.cur = wo_strlen(tx.s); }
-        else if (id == HB_ENC_KNOB1 || id == HB_ENC_ALGORITHM) {
-            int n = (int)sizeof SYMS - 1;
-            tx.sym = ((tx.sym + arg) % n + n) % n;
-        }
+        else if (id == HB_ENC_KNOB1 || id == HB_ENC_ALGORITHM) { int n = (int)sizeof SYMS - 1; tx.sym = ((tx.sym + arg) % n + n) % n; }
         return;
     }
     if (kind != HB_EV_BTN_DOWN) return;
@@ -295,7 +335,8 @@ static void text_event(uint32_t kind, uint32_t id, int32_t arg)
     } else if (id == HB_BTN_OCT_UP) text_insert(' ');
     else if (id == HB_BTN_EDIT) tx.shift = !tx.shift;
     else if (id == HB_BTN_FX) text_insert(SYMS[tx.sym]);
-    else if (id == HB_BTN_SEL || id == HB_BTN_SAVE) text_done();
+    else if (id == HB_BTN_SEL) text_done();
+    else if (id == HB_BTN_HOME) pop();
 }
 
 /* ================================================================ glossary */
@@ -349,10 +390,11 @@ static void draw_gloss(void)
     for (i = 0; i < gl_n; i++) {
         const char *term = WO_GLOSS_TERMS + WO_GLOSS_TOFF[gl_found[i]];
         wo_str(WO_GLOSS[gl_found[i]].def, def, WO_LINE);
-        lv_add(i, 4, 0, 0, "", term, C(TC_SIGNAL), C(TC_INK));
-        lv_add(i, 12, 0, 0, "", def, C(TC_TEXT), C(TC_INK));
+        lv_add(i, 3, 0, 0, "", term, C(TC_SIGNAL), C(TC_INK));
+        lv_add(i, 9, 0, 0, "", def, C(TC_TEXT), C(TC_INK));
     }
-    chrome("GLOSSARY", "", "SELECT scroll  HOME back");
+    keys_clear(); K(HB_BTN_HOME, "back", 0);
+    chrome("GLOSSARY", " ");
     lv_draw(TOP.sel);
 }
 
@@ -399,16 +441,52 @@ static void sync_scale(void)
     wo_synth_scale(0, 0x0FFF);
 }
 
-static void play_toggle(void)
+static int have_chords(void) { int bpm; const wo_chords_t *c = chords_now(&bpm); return c && c->n; }
+
+static void chords_toggle(void)
 {
     int bpm;
     const wo_chords_t *c = chords_now(&bpm);
-    if (wo_synth_playing()) { wo_synth_stop(); toast("Stopped"); return; }
+    if (!W.set.sound) { toast("Sound is off (Settings)"); return; }
+    if (wo_synth_playing()) { wo_synth_stop(); toast("Chords stopped"); return; }
     if (!c || !c->n) { toast("No chords rolled: switch Chords on"); return; }
     wo_synth_play(c, bpm, H->ms());
 }
 
 static void mode_name(uint8_t m, char *o, int cap) { wo_str(WO_MODES[m < WO_NMODES ? m : 0].name, o, cap); }
+
+/* the keys every page shares: SCL, HOME, ENV, PLAY (set before the page adds its own) */
+static void keys_common(void)
+{
+    keys_clear();
+    if (depth) K(HB_BTN_HOME, "back", 0);
+    if (have_chords()) K(HB_BTN_ENV, wo_synth_playing() ? "stop" : "chords", 0);
+    if (!W.has_cur) K(HB_BTN_PLAY, "start", 0);
+    else K(HB_BTN_PLAY, W.cur.running ? "pause" : "resume", "finish");
+}
+
+/* PLAY with no ticket: roll what is set up and start the clock, in one press */
+static void quick_start(void)
+{
+    wo_synth_stop();
+    if (W.set.mode != M_FREE && W.set.mode < WO_NMODES) {
+        char b[40];
+        wo_start_mode(W.set.mode);
+        wo_store_mark(ST_ALL);
+        mode_name(W.set.mode, b, 32); wo_strcat(b, " started", 40);
+        go_root(PG_SESSION); toast(b);
+        return;
+    }
+    if (!(TOP.page == PG_ROLL || TOP.page == PG_FIELD) || !wo_draft_ready()) {
+        int i, on = 0;
+        for (i = 0; i < WO_NFIELDS; i++) on += W.on[i];
+        if (!on) { toast("Switch a parameter on first (Roll)"); return; }
+        wo_roll_all();
+    }
+    wo_issue();
+    wo_store_mark(ST_CUR | ST_STATE | ST_DRAFT);
+    go_root(PG_SESSION); toast("Ticket started");
+}
 
 /* ================================================================ HOME */
 static const char *const HOME_ITEMS[] = {"Roll", "Session", "Modes", "Parked", "Library", "Scores", "Rules", "Gear",
@@ -416,83 +494,92 @@ static const char *const HOME_ITEMS[] = {"Roll", "Session", "Modes", "Parked", "
 #define NHOME 12
 static void draw_home(void)
 {
-    char sub[40];
+    char sub[48];
     int i;
     lv_reset();
+    if (W.has_cur) {
+        lv_note(W.cur.name, C(TC_SIGNAL));
+        wo_strcpy(sub, "", 48); wo_catu(sub, wo_ticket_score(&W.cur), 48); wo_strcat(sub, " pts, ", 48);
+        { int k, d = 0; for (k = 0; k < W.cur.nitems; k++) d += !!(W.cur.item[k].flags & I_CHECKED);
+          wo_catu(sub, (uint32_t)d, 48); wo_strcat(sub, " of ", 48); wo_catu(sub, W.cur.nitems, 48); wo_strcat(sub, " ticked", 48); }
+        lv_note(sub, C(TC_DIM));
+    } else lv_note("No ticket. PLAY rolls one and starts the clock.", C(TC_DIM));
     for (i = 0; i < NHOME; i++) {
         int on = 0, k;
+        char row[COLS + 1];
         sub[0] = 0;
         switch (i) {
-        case 0: for (k = 0; k < WO_NFIELDS; k++) on += W.on[k]; wo_catu(sub, (uint32_t)on, 40); wo_strcat(sub, " params", 40);
-                if (wo_draft_ready()) wo_strcat(sub, ", ready", 40); break;
-        case 1: if (W.has_cur) { wo_strcpy(sub, W.cur.name, 19); } else wo_strcpy(sub, "no ticket", 40); break;
-        case 2: mode_name(W.set.mode, sub, 19); break;
-        case 3: wo_catu(sub, (uint32_t)wo_parked_count(), 40); wo_strcat(sub, " of 2", 40); break;
-        case 4: wo_catu(sub, (uint32_t)wo_lib_count(), 40); wo_strcat(sub, " filed", 40); break;
-        case 5: wo_catu(sub, W.nscores, 40); wo_strcat(sub, " scored", 40); break;
-        case 6: wo_catu(sub, WO_NENTRIES + W.ncustom, 40); wo_strcat(sub, " rules", 40); break;
-        case 7: for (k = 0; k < W.ninv; k++) on += wo_inv_on((uint8_t)k); wo_catu(sub, (uint32_t)on, 40); wo_strcat(sub, " on", 40); break;
-        case 8: wo_catu(sub, WO_NMAT + W.nmatadd, 40); wo_strcat(sub, " sounds", 40); break;
-        case 9: wo_catu(sub, WO_NBUILTIN, 40); wo_strcat(sub, " setups", 40); break;
+        case 0: for (k = 0; k < WO_NFIELDS; k++) on += W.on[k];
+                wo_catu(sub, (uint32_t)on, 48); wo_strcat(sub, " params", 48);
+                if (wo_draft_ready()) wo_strcat(sub, ", rolled", 48);
+                break;
+        case 1: wo_strcpy(sub, W.has_cur ? (W.cur.running ? "running" : "paused") : "no ticket", 48); break;
+        case 2: mode_name(W.set.mode, sub, 30); break;
+        case 3: wo_catu(sub, (uint32_t)wo_parked_count(), 48); wo_strcat(sub, " of 2", 48); break;
+        case 4: wo_catu(sub, (uint32_t)wo_lib_count(), 48); wo_strcat(sub, " filed", 48); break;
+        case 5: wo_catu(sub, W.nscores, 48); wo_strcat(sub, " scored", 48); break;
+        case 6: wo_catu(sub, WO_NENTRIES + W.ncustom, 48); wo_strcat(sub, " rules", 48); break;
+        case 7: for (k = 0; k < W.ninv; k++) on += wo_inv_on((uint8_t)k); wo_catu(sub, (uint32_t)on, 48); wo_strcat(sub, " on", 48); break;
+        case 8: wo_catu(sub, WO_NMAT + W.nmatadd, 48); wo_strcat(sub, " sounds", 48); break;
+        case 9: wo_catu(sub, WO_NBUILTIN, 48); wo_strcat(sub, " setups", 48); break;
         default: break;
         }
         {
-            char row[32];
             int l, pad;
-            wo_strcpy(row, HOME_ITEMS[i], 32);
-            l = wo_strlen(row); pad = 28 - l - wo_strlen(sub);
-            while (pad-- > 0 && l < 30) row[l++] = ' ';
+            wo_strcpy(row, HOME_ITEMS[i], COLS + 1);
+            l = wo_strlen(row); pad = 37 - l - wo_strlen(sub);
+            while (pad-- > 0 && l < COLS) row[l++] = ' ';
             row[l] = 0;
-            wo_strcat(row, sub, 31);
-            lv_add(i, 8, 0, 0, "", row, i == 1 && W.has_cur ? C(TC_SIGNAL) : C(TC_TEXT), C(TC_INK));
+            wo_strcat(row, sub, COLS + 1);
+            lv_add(i, 6, 0, 0, "", row, C(TC_TEXT), C(TC_INK));
         }
     }
-    chrome("WORKORDER", WO_BUILD " FM-1", "SELECT move  SCL open");
+    keys_common();
+    K(HB_BTN_SEL, "open", 0);
+    chrome("WORKORDER", WO_BUILD " FM-1");
     lv_draw(TOP.sel);
 }
-static void open_home(int i)
+static void home_event(uint32_t kind, uint32_t id, int32_t arg)
 {
     static const uint8_t P[NHOME] = {PG_ROLL, PG_SESSION, PG_MODES, PG_PARKED, PG_LIBRARY, PG_SCORES, PG_RULES, PG_GEAR,
                                      PG_MATS, PG_PRESETS, PG_SETTINGS, PG_HELP};
-    if (i >= 0 && i < NHOME) push(P[i], 0);
+    (void)arg;
+    if (kind == HB_EV_BTN_DOWN && id == HB_BTN_SEL && TOP.sel >= 0 && TOP.sel < NHOME) push(P[TOP.sel], 0);
 }
 
 /* ================================================================ ROLL */
 static void draw_roll(void)
 {
-    char conf[WO_NCONF][WO_CONFLEN], pre[20], lab[24];
+    char conf[WO_NCONF][WO_CONFLEN], pre[24], lab[24];
     uint8_t idx[WO_MAXLINES];
     int nc = W.has_draft ? wo_conflicts(&W.draft, conf, WO_NCONF) : 0, i, j;
     lv_reset();
-    for (i = 0; i < nc; i++) { lv_add(-1, 4, 0, 0, "! ", conf[i], C(TC_SIGNAL), C(TC_INK)); }
+    for (i = 0; i < nc; i++) lv_add(-1, 3, 0, 0, "! ", conf[i], C(TC_SIGNAL), C(TC_INK));
     for (i = 0; i < WO_NFIELDS; i++) {
         uint8_t f = WO_ORDER[i];
-        int on = W.on[f];
-        uint16_t fg = on ? C(TC_TEXT) : C(TC_DIMMER);
+        int on = W.on[f], sel = TOP.sel == i;
         wo_field_name(f, lab, 24);
-        pre[0] = 0;
-        wo_strcat(pre, on ? "" : "-", 20);
-        wo_strcat(pre, lab, 20);
-        if (W.lock[f]) wo_strcat(pre, "*", 20);
-        if (W.count[f]) { wo_strcat(pre, " x", 20); wo_catu(pre, W.count[f], 20); }
-        if (W.mixin[f]) wo_strcat(pre, " mix", 20);
-        while (wo_strlen(pre) < 12) wo_strcat(pre, " ", 20);
-        wo_strcat(pre, " ", 20);
-        if (TOP.sel == i && on && W.has_draft && W.draft.has[f]) {
-            lv_add(i, 16, TIERCH[W.sev[f]], tier_col(W.sev[f]), "", pre, C(TC_SIGNAL), C(TC_INK));
-            if (f == F_KEY || f == F_TEMPO || f == F_GEAR) { field_preview(f, tb, WO_LINE); lv_add(i, 20, 0, 0, "", tb, C(TC_TEXT), C(TC_INK)); }
-            if (f == F_GEAR) for (j = 1; j < W.draft.gear.nslots; j++) { wo_slot_text(&W.draft.gear.slot[j], tb, WO_LINE); lv_add(i, 20, 0, 0, "", tb, C(TC_TEXT), C(TC_INK)); }
+        lab[11] = 0;
+        wo_strcpy(pre, lab, 24);
+        if (W.lock[f]) wo_strcat(pre, "*", 24);
+        if (W.count[f]) { wo_strcat(pre, "x", 24); wo_catu(pre, W.count[f], 24); }
+        while (wo_strlen(pre) < 13) wo_strcat(pre, " ", 24);
+        if (sel && on && W.has_draft && W.draft.has[f]) {
+            lv_add(i, 4, TIERCH[W.sev[f]], tier_col(W.sev[f]), "", pre, C(TC_SIGNAL), C(TC_INK));
+            if (f == F_KEY || f == F_TEMPO || f == F_GEAR) { field_preview(f, tb, WO_LINE); lv_add(i, 21, 0, 0, "", tb, C(TC_TEXT), C(TC_INK)); }
+            if (f == F_GEAR) for (j = 1; j < W.draft.gear.nslots; j++) { wo_slot_text(&W.draft.gear.slot[j], tb, WO_LINE); lv_add(i, 21, 0, 0, "", tb, C(TC_TEXT), C(TC_INK)); }
             {
                 int n = wo_field_lines(&W.draft, f, idx, WO_MAXLINES);
-                for (j = 0; j < n; j++) lv_add(i, 20, 0, 0, (W.draft.line[idx[j]].flags & L_HEAD) ? "" : "> ", W.draft.line[idx[j]].text,
+                for (j = 0; j < n; j++) lv_add(i, 21, 0, 0, (W.draft.line[idx[j]].flags & L_HEAD) ? "" : "> ", W.draft.line[idx[j]].text,
                                                (W.draft.line[idx[j]].flags & L_HEAD) ? C(TC_SIGNAL) : C(TC_TEXT), C(TC_INK));
             }
         } else {
-            char row[64];
-            wo_strcpy(row, pre, 64);
-            if (on) { field_preview(f, tb, WO_LINE); wo_strcat(row, tb, 64); }
+            char row[96];
+            wo_strcpy(row, pre, 96);
+            if (on) { field_preview(f, tb, WO_LINE); wo_strcat(row, tb, 96); }
+            else wo_strcat(row, "off", 96);
             lv_nowrap = 1;
-            lv_add(i, 16, TIERCH[W.sev[f]], on ? tier_col(W.sev[f]) : C(TC_DIMMER), "", row, fg, C(TC_INK));
+            lv_add(i, 4, TIERCH[W.sev[f]], on ? tier_col(W.sev[f]) : C(TC_DIMMER), "", row, on ? C(TC_TEXT) : C(TC_DIMMER), C(TC_INK));
         }
     }
     {
@@ -500,36 +587,39 @@ static void draw_roll(void)
         for (k = 0; k < WO_NFIELDS; k++) on += W.on[k];
         right[0] = 0;
         if (nc) { wo_strcat(right, "!", 24); wo_catu(right, (uint32_t)nc, 24); wo_strcat(right, " ", 24); }
-        wo_strcat(right, wo_draft_ready() ? "READY" : "", 24);
-        chrome("ROLL", right[0] ? right : " ", "REC roll  ARP one  LFO issue");
+        wo_catu(right, (uint32_t)on, 24); wo_strcat(right, " on", 24);
+        if (wo_draft_ready()) wo_strcat(right, " READY", 24);
+        keys_common();
+        K(HB_BTN_SEL, "open", 0); K(HB_BTN_EDIT, "on/off", 0); K(HB_BTN_SAVE, "hold", 0); K(HB_BTN_REC, "ROLL", 0);
+        K(HB_BTN_ARP, "reroll", 0); K(HB_BTN_SEQ, "mutate", 0); K(HB_BTN_LFO, "random", 0); K(HB_BTN_GLO, "terms", 0);
+        if (!W.has_cur && wo_draft_ready()) K(HB_BTN_PLAY, "START", 0);
+        chrome("ROLL", right);
     }
     lv_draw(TOP.sel);
 }
 
+static void roll_knobs(uint8_t f, uint32_t id, int32_t arg)
+{
+    if (id == HB_ENC_ALGORITHM) { int s = W.sev[f] + (arg > 0 ? 1 : -1); W.sev[f] = (uint8_t)(s < 0 ? 0 : s > 2 ? 2 : s); }
+    else if (id == HB_ENC_KNOB1) { int c = W.count[f] + (arg > 0 ? 1 : -1); W.count[f] = (uint8_t)(c < 0 ? 0 : c > 6 ? 6 : c); }
+    else if (id == HB_ENC_KNOB2) W.mixin[f] = arg > 0;
+    else return;
+    wo_store_mark(ST_STATE);
+}
+
 static void roll_event(uint32_t kind, uint32_t id, int32_t arg)
 {
-    uint8_t f = WO_ORDER[TOP.sel < WO_NFIELDS ? TOP.sel : 0];
-    if (kind == HB_EV_ENC) {
-        if (id == HB_ENC_ALGORITHM) { int s = W.sev[f] + (arg > 0 ? 1 : -1); W.sev[f] = (uint8_t)(s < 0 ? 0 : s > 2 ? 2 : s); wo_store_mark(ST_STATE); }
-        else if (id == HB_ENC_KNOB1) { int c = W.count[f] + (arg > 0 ? 1 : -1); W.count[f] = (uint8_t)(c < 0 ? 0 : c > 6 ? 6 : c); wo_store_mark(ST_STATE); }
-        else if (id == HB_ENC_KNOB2) { W.mixin[f] = arg > 0; wo_store_mark(ST_STATE); }
-        return;
-    }
+    uint8_t f = WO_ORDER[TOP.sel >= 0 && TOP.sel < WO_NFIELDS ? TOP.sel : 0];
+    if (kind == HB_EV_ENC) { roll_knobs(f, id, arg); return; }
     if (kind != HB_EV_BTN_DOWN) return;
     switch (id) {
     case HB_BTN_EDIT: W.on[f] = !W.on[f]; wo_store_mark(ST_STATE); break;
     case HB_BTN_SAVE: W.lock[f] = !W.lock[f]; toast(W.lock[f] ? "Held: rolls leave it alone" : "Released"); wo_store_mark(ST_STATE); break;
     case HB_BTN_REC: wo_synth_stop(); wo_roll_all(); wo_store_mark(ST_DRAFT | ST_STATE); toast("Rolled"); break;
-    case HB_BTN_ARP: if (W.on[f]) { wo_roll_field(f); wo_store_mark(ST_DRAFT | ST_STATE); } else toast("Switch it on first (EDIT)"); break;
+    case HB_BTN_ARP: if (W.on[f]) { wo_roll_field(f); wo_store_mark(ST_DRAFT | ST_STATE); } else toast("It is off: EDIT switches it on"); break;
     case HB_BTN_SEQ: wo_mutate(); wo_store_mark(ST_DRAFT | ST_STATE); toast("Mutated"); break;
-    case HB_BTN_FX: wo_full_random(); wo_store_mark(ST_DRAFT | ST_STATE); toast(W.set.chaos ? "Chaos roll" : "Random roll"); break;
+    case HB_BTN_LFO: wo_full_random(); wo_store_mark(ST_DRAFT | ST_STATE); toast(W.set.chaos ? "Chaos roll" : "Random roll"); break;
     case HB_BTN_SEL: push(PG_FIELD, f); break;
-    case HB_BTN_LFO:
-        if (!wo_draft_ready()) { toast("Roll every parameter first"); break; }
-        if (W.has_cur && wo_park()) { toast("Park slots full: close a ticket"); break; }
-        wo_issue(); wo_store_mark(ST_CUR | ST_STATE | ST_DRAFT);
-        go_root(PG_SESSION); toast("Ticket issued");
-        break;
     case HB_BTN_GLO: {
         uint8_t idx[WO_MAXLINES]; int n = W.has_draft ? wo_field_lines(&W.draft, f, idx, WO_MAXLINES) : 0, j;
         tb[0] = 0;
@@ -549,67 +639,64 @@ static void draw_field(void)
     char title[40], right[24];
     int n = 0, i;
     lv_reset();
+    {
+        char b[64];
+        wo_strcpy(b, "Severity ", 64); wo_strcat(b, wo_tier_name(W.sev[f]), 64);
+        wo_strcat(b, " (ALGO)  lines ", 64);
+        if (W.count[f]) wo_catu(b, W.count[f], 64); else wo_strcat(b, "auto", 64);
+        wo_strcat(b, " (KNOB1)", 64);
+        lv_note(b, C(TC_DIM));
+        lv_note(W.mixin[f] ? "Mixed severity per line (KNOB2)" : "One severity for all lines (KNOB2: mixed)", C(TC_DIMMER));
+    }
     if (W.has_draft && d->has[f]) {
         if (f == F_KEY) {
-            wo_key_line(&d->key, tb, WO_LINE); lv_add(0, 4, 0, 0, "", tb, C(TC_TEXT), C(TC_INK));
-            wo_str(WO_SCALES[d->key.scale].chr, tb, WO_LINE); lv_add(0, 12, 0, 0, "", tb, C(TC_DIM), C(TC_INK));
+            wo_key_line(&d->key, tb, WO_LINE); lv_add(0, 3, 0, 0, "", tb, C(TC_TEXT), C(TC_INK));
+            wo_str(WO_SCALES[d->key.scale].chr, tb, WO_LINE); lv_add(0, 9, 0, 0, "", tb, C(TC_DIM), C(TC_INK));
         } else if (f == F_TEMPO) {
-            wo_tempo_line(&d->tempo, tb, WO_LINE); lv_add(0, 4, 0, 0, "", tb, C(TC_TEXT), C(TC_INK));
-            wo_str(WO_BANDS[d->tempo.band].name, tb, WO_LINE); lv_add(0, 12, 0, 0, "Band: ", tb, C(TC_DIM), C(TC_INK));
+            wo_tempo_line(&d->tempo, tb, WO_LINE); lv_add(0, 3, 0, 0, "", tb, C(TC_TEXT), C(TC_INK));
+            wo_str(WO_BANDS[d->tempo.band].name, tb, WO_LINE); lv_add(0, 9, 0, 0, "Band: ", tb, C(TC_DIM), C(TC_INK));
         } else if (f == F_GEAR) {
-            if (d->gear.empty) lv_note("No category feeds GEAR. Fix it on the Gear page (SEQ).", C(TC_SIGNAL));
+            if (d->gear.empty) lv_note("No category feeds GEAR. Fix it on the Gear page.", C(TC_SIGNAL));
             if (d->gear.nbanned) {
                 wo_strcpy(tb, "Banned this session: ", WO_LINE);
                 for (i = 0; i < d->gear.nbanned; i++) { if (i) wo_strcat(tb, ", ", WO_LINE); wo_strcat(tb, W.inv[d->gear.banned[i]].name, WO_LINE); }
                 lv_note(tb, C(TC_TEXT));
             }
-            for (i = 0; i < d->gear.nslots; i++) { wo_slot_text(&d->gear.slot[i], tb, WO_LINE); lv_add(-1, 4, 0, 0, "- ", tb, C(TC_TEXT), C(TC_INK)); }
+            for (i = 0; i < d->gear.nslots; i++) { wo_slot_text(&d->gear.slot[i], tb, WO_LINE); lv_add(-1, 3, 0, 0, "- ", tb, C(TC_TEXT), C(TC_INK)); }
             if (d->gear.exclusive) lv_note("Nothing else may be loaded.", C(TC_TEXT));
         }
         n = wo_field_lines(d, f, idx, WO_MAXLINES);
         for (i = 0; i < n; i++) {
             const wo_line_t *l = &d->line[idx[i]];
             int e = (f == F_KEY || f == F_TEMPO) ? 0 : i;
-            lv_add(e, 16, l->tier < 3 ? TIERCH[l->tier] : 0, tier_col(l->tier), "", l->text,
+            lv_add(e, 4, l->tier < 3 ? TIERCH[l->tier] : 0, tier_col(l->tier), "", l->text,
                    (l->flags & L_HEAD) ? C(TC_SIGNAL) : C(TC_TEXT), C(TC_INK));
         }
         if (f == F_GEAR && !n) lv_note("(no directives)", C(TC_DIMMER));
     } else lv_note(W.on[f] ? "Not rolled yet. REC rolls it." : "Switched off. EDIT switches it on.", C(TC_DIM));
-    lv_note(" ", C(TC_DIM));
-    {
-        char b[64];
-        wo_strcpy(b, "Severity ", 64); wo_strcat(b, wo_tier_name(W.sev[f]), 64);
-        wo_strcat(b, "  lines ", 64);
-        if (W.count[f]) wo_catu(b, W.count[f], 64); else wo_strcat(b, "auto", 64);
-        if (W.mixin[f]) wo_strcat(b, "  mixed", 64);
-        lv_note(b, C(TC_DIM));
-        lv_note("ALGO severity KNOB1 lines KNOB2 mixed  SAVE hold  EDIT on/off", C(TC_DIMMER));
-    }
     wo_field_name(f, title, 40);
-    { int k; for (k = 0; title[k]; k++) if (title[k] >= 'a' && title[k] <= 'z') title[k] = (char)(title[k] - 32); }
+    upcase(title);
     wo_strcpy(right, W.on[f] ? "" : "OFF ", 24);
     if (W.lock[f]) wo_strcat(right, "HELD", 24);
-    chrome(title, right[0] ? right : " ", "ARP line  REC all  GLO terms");
+    keys_common();
+    K(HB_BTN_EDIT, "on/off", 0); K(HB_BTN_SAVE, "hold", 0); K(HB_BTN_REC, "ROLL", 0); K(HB_BTN_GLO, "terms", 0);
+    if (f != F_KEY && f != F_TEMPO && n) K(HB_BTN_ARP, "line", 0); else K(HB_BTN_ARP, "reroll", 0);
+    if (!W.has_cur && wo_draft_ready()) K(HB_BTN_PLAY, "START", 0);
+    chrome(title, right[0] ? right : " ");
     lv_draw(TOP.sel);
 }
 
 static void field_event(uint32_t kind, uint32_t id, int32_t arg)
 {
     uint8_t f = (uint8_t)TOP.arg, idx[WO_MAXLINES];
-    if (kind == HB_EV_ENC) {
-        if (id == HB_ENC_ALGORITHM) { int s = W.sev[f] + (arg > 0 ? 1 : -1); W.sev[f] = (uint8_t)(s < 0 ? 0 : s > 2 ? 2 : s); }
-        else if (id == HB_ENC_KNOB1) { int c = W.count[f] + (arg > 0 ? 1 : -1); W.count[f] = (uint8_t)(c < 0 ? 0 : c > 6 ? 6 : c); }
-        else if (id == HB_ENC_KNOB2) W.mixin[f] = arg > 0;
-        wo_store_mark(ST_STATE);
-        return;
-    }
+    if (kind == HB_EV_ENC) { roll_knobs(f, id, arg); return; }
     if (kind != HB_EV_BTN_DOWN) return;
     switch (id) {
     case HB_BTN_EDIT: W.on[f] = !W.on[f]; wo_store_mark(ST_STATE); break;
     case HB_BTN_SAVE: W.lock[f] = !W.lock[f]; wo_store_mark(ST_STATE); break;
-    case HB_BTN_REC: if (W.on[f]) { wo_roll_field(f); wo_store_mark(ST_DRAFT | ST_STATE); } break;
+    case HB_BTN_REC: if (W.on[f]) { wo_roll_field(f); wo_store_mark(ST_DRAFT | ST_STATE); } else toast("It is off: EDIT switches it on"); break;
     case HB_BTN_ARP:
-        if (!W.on[f]) break;
+        if (!W.on[f]) { toast("It is off: EDIT switches it on"); break; }
         if (f == F_KEY || f == F_TEMPO || !W.has_draft || !W.draft.has[f]) wo_roll_field(f);
         else if (!wo_reroll_line(f, (uint8_t)TOP.sel)) wo_roll_field(f);
         wo_store_mark(ST_DRAFT | ST_STATE);
@@ -619,88 +706,91 @@ static void field_event(uint32_t kind, uint32_t id, int32_t arg)
         if (n && TOP.sel < n) gloss_open(W.draft.line[idx[TOP.sel]].text, f);
         else { field_preview(f, tb, WO_LINE); gloss_open(tb, f); }
         break; }
-    case HB_BTN_LFO: roll_event(kind, id, arg); break;
     default: break;
     }
 }
 
 /* ================================================================ SESSION */
 static uint8_t item_skey(const wo_item_t *it) { return it->label >= 100 ? WO_POOL_SKEY[it->label - 100] : it->pkey; }
+static int session_hand(void) { return W.has_cur && W.cur.is_run && !W.cur.run.ended && W.cur.run.nhand; }
 
 static void draw_session(void)
 {
     wo_ticket_t *c = &W.cur;
-    char b[80], lab[24];
-    int i, hand = 0;
+    char b[96], lab[24];
+    int i, hand = session_hand();
     lv_reset();
+    keys_common();
     if (!W.has_cur) {
         lv_note("No ticket in play.", C(TC_TEXT));
-        lv_note("Roll one on the Roll page (LFO issues it), start a game mode, or resume a parked one.", C(TC_DIM));
-        chrome("SESSION", " ", "HOME back");
+        lv_note("PLAY rolls your setup and starts the clock. Or tweak it on the Roll page first, start a game mode, or resume a parked ticket.", C(TC_DIM));
+        chrome("SESSION", " ");
         lv_draw(-1);
         return;
     }
     b[0] = 0;
-    wo_strcat(b, "pts ", 80); wo_catu(b, wo_ticket_score(c), 80); wo_strcat(b, " / ", 80); wo_catu(b, wo_ticket_max(c), 80);
+    wo_strcat(b, "pts ", 96); wo_catu(b, wo_ticket_score(c), 96); wo_strcat(b, " / ", 96); wo_catu(b, wo_ticket_max(c), 96);
     mode_name(c->mode, lab, 24);
-    wo_strcat(b, "  ", 80); wo_strcat(b, c->running ? lab : "PAUSED", 80);
+    wo_strcat(b, "   ", 96); wo_strcat(b, c->running ? lab : "PAUSED: PLAY resumes", 96);
     lv_note(b, c->running ? C(TC_DIM) : C(TC_SIGNAL));
     lv_note(c->name, C(TC_DIMMER));
-    if (c->powered_off) lv_note("The clock stopped when the FM-1 was switched off. LFO starts it again.", C(TC_SIGNAL));
+    if (c->powered_off) lv_note("The clock stopped when the FM-1 was switched off. PLAY starts it again.", C(TC_SIGNAL));
     if (c->limit_ms && wo_elapsed(c) > c->limit_ms) lv_note("Time is up: nothing ticked now scores.", C(TC_SIGNAL));
     else if (c->target_min && wo_elapsed(c) > c->target_min * 60000u) lv_note("Past your target time.", C(TC_SIGNAL));
-    for (i = 0; i < c->nconf; i++) lv_add(-1, 4, 0, 0, "! ", c->conf[i], C(TC_SIGNAL), C(TC_INK));
+    for (i = 0; i < c->nconf; i++) lv_add(-1, 3, 0, 0, "! ", c->conf[i], C(TC_SIGNAL), C(TC_INK));
     if (c->is_run) {
         const wo_run_t *r = &c->run;
-        wo_strcpy(b, "ROUND ", 80); wo_catu(b, r->round, 80); wo_strcat(b, "/", 80); wo_catu(b, r->nladder, 80);
-        wo_strcat(b, "  lives ", 80);
-        for (i = 0; i < r->maxlives; i++) wo_strcat(b, i < r->lives ? "#" : ".", 80);
-        if (r->round >= 1 && r->round <= r->nladder) { wo_strcat(b, "  ", 80); wo_strcat(b, wo_tier_name(r->ladder[r->round - 1]), 80); }
-        if (r->genre != NONE8) { wo_str(WO_GENRE[r->genre], lab, 24); wo_strcat(b, "  ", 80); wo_strcat(b, lab, 80); }
+        wo_strcpy(b, "ROUND ", 96); wo_catu(b, r->round, 96); wo_strcat(b, "/", 96); wo_catu(b, r->nladder, 96);
+        wo_strcat(b, "  lives ", 96);
+        for (i = 0; i < r->maxlives; i++) wo_strcat(b, i < r->lives ? "#" : ".", 96);
+        if (r->round >= 1 && r->round <= r->nladder) { wo_strcat(b, "  ", 96); wo_strcat(b, wo_tier_name(r->ladder[r->round - 1]), 96); }
+        if (r->genre != NONE8) { wo_str(WO_GENRE[r->genre], lab, 24); wo_strcat(b, "  ", 96); wo_strcat(b, lab, 96); }
         lv_note(b, C(TC_CYAN));
         if (r->ended) {
-            wo_strcpy(b, r->won ? "RUN COMPLETE  +" : (r->reason == 1 ? "RUN OVER: a brutal card was broken" : "RUN OVER: out of lives"), 80);
-            if (r->won) wo_catu(b, r->bonus, 80);
+            wo_strcpy(b, r->won ? "RUN COMPLETE  +" : (r->reason == 1 ? "RUN OVER: a brutal card was broken" : "RUN OVER: out of lives"), 96);
+            if (r->won) wo_catu(b, r->bonus, 96);
             lv_note(b, r->won ? C(TC_CYAN) : C(TC_MAGENTA));
-            lv_note("EDIT closes and files it.", C(TC_DIM));
+            lv_note("Hold PLAY to finish and file it.", C(TC_DIM));
         } else if (r->nhand) {
-            hand = 1;
-            lv_note("Keep one card. SCL takes it, ARP deals again.", C(TC_TEXT));
+            lv_note("Keep one card: SCL takes it, REC deals again.", C(TC_TEXT));
             for (i = 0; i < r->nhand; i++) {
                 const wo_card_t *k = &r->hand[i];
                 wo_card_label(k, lab, 24);
-                wo_strcpy(b, lab, 80); wo_strcat(b, "  +", 80); wo_catu(b, k->pts, 80);
-                if (k->risk == RISK_FIGHTS) wo_strcat(b, "  FIGHTS YOUR DECK", 80);
-                else if (k->risk == RISK_DOUBLES) wo_strcat(b, "  DOUBLES UP", 80);
-                else if (k->risk == RISK_PILES) wo_strcat(b, "  PILES ON", 80);
-                lv_add(i, 16, TIERCH[k->tier], tier_col(k->tier), "", b, k->risk ? C(TC_SIGNAL) : C(TC_DIM), C(TC_INK2));
-                lv_add(i, 16, 0, 0, "", k->text, C(TC_TEXT), C(TC_INK2));
+                wo_strcpy(b, lab, 96); wo_strcat(b, "  +", 96); wo_catu(b, k->pts, 96);
+                if (k->risk == RISK_FIGHTS) wo_strcat(b, "  FIGHTS YOUR DECK", 96);
+                else if (k->risk == RISK_DOUBLES) wo_strcat(b, "  DOUBLES UP", 96);
+                else if (k->risk == RISK_PILES) wo_strcat(b, "  PILES ON", 96);
+                lv_add(i, 4, TIERCH[k->tier], tier_col(k->tier), "", b, k->risk ? C(TC_SIGNAL) : C(TC_DIM), C(TC_INK2));
+                lv_add(i, 13, 0, 0, "", k->text, C(TC_TEXT), C(TC_INK2));
             }
             if (c->nitems) lv_note("Your deck:", C(TC_DIM));
-        } else if (c->nitems) lv_note("Tick the card off to reach the next round.", C(TC_DIM));
+        } else if (c->nitems) lv_note("Tick the card off (SCL) to reach the next round.", C(TC_DIM));
     }
     for (i = 0; i < c->nitems; i++) {
         const wo_item_t *it = &c->item[i];
         int e = hand ? -1 : i;
         const char *mark = (it->flags & I_BROKEN) ? "[/] " : (it->flags & I_CHECKED) ? "[x] " : "[ ] ";
         uint16_t fg = (it->flags & I_BROKEN) ? C(TC_DIMMER) : (it->flags & I_CHECKED) ? C(TC_DIM) : (it->flags & I_HEAD) ? C(TC_SIGNAL) : C(TC_TEXT);
-        lv_add(e, 16, it->tier < 3 ? TIERCH[it->tier] : 0, tier_col(it->tier), mark, it->text, fg, C(TC_INK));
-        if (it->flags & I_BROKEN) { wo_strcpy(b, "broke it: ", 80); wo_strcat(b, it->why, 80); lv_add(e, 48, 0, 0, "", b, C(TC_MAGENTA), C(TC_INK)); }
+        lv_add(e, 4, it->tier < 3 ? TIERCH[it->tier] : 0, tier_col(it->tier), mark, it->text, fg, C(TC_INK));
+        if (it->flags & I_BROKEN) { wo_strcpy(b, "broke it: ", 96); wo_strcat(b, it->why, 96); lv_add(e, 37, 0, 0, "", b, C(TC_MAGENTA), C(TC_INK)); }
         if (!hand && TOP.sel == i) {
             wo_item_label(it, lab, 24);
-            wo_strcpy(b, lab, 80);
-            if (it->tier < 3) { wo_strcat(b, " | ", 80); wo_strcat(b, wo_tier_name(it->tier), 80); }
-            if (it->flags & I_CHECKED) { wo_strcat(b, " | +", 80); wo_catu(b, it->pts, 80); }
-            else if (!(it->flags & I_BROKEN)) { wo_strcat(b, " | now +", 80); wo_catu(b, (uint32_t)wo_item_points(c, it, wo_elapsed(c)), 80); }
-            if (it->flags & I_WASBROKEN) wo_strcat(b, " | broken earlier", 80);
-            lv_add(e, 48, 0, 0, "", b, C(TC_DIMMER), C(TC_INK));
+            wo_strcpy(b, lab, 96);
+            if (it->tier < 3) { wo_strcat(b, " | ", 96); wo_strcat(b, wo_tier_name(it->tier), 96); }
+            if (it->flags & I_CHECKED) { wo_strcat(b, " | +", 96); wo_catu(b, it->pts, 96); }
+            else if (!(it->flags & I_BROKEN)) { wo_strcat(b, " | now +", 96); wo_catu(b, (uint32_t)wo_item_points(c, it, wo_elapsed(c)), 96); }
+            if (it->flags & I_WASBROKEN) wo_strcat(b, " | broken earlier", 96);
+            lv_add(e, 37, 0, 0, "", b, C(TC_DIMMER), C(TC_INK));
         }
     }
-    {
-        char t[24];
-        wo_strcpy(t, c->is_run ? "RUN" : "SESSION", 24);
-        chrome(t, "", hand ? "SCL take  ARP deal again" : (c->is_run && c->run.ended) ? "EDIT close & file" : "SCL tick REC break LFO pause");
+    if (hand) { K(HB_BTN_SEL, "take", 0); K(HB_BTN_REC, "deal", 0); }
+    else if (TOP.sel >= 0 && TOP.sel < c->nitems) {
+        int br = c->item[TOP.sel].flags & I_BROKEN;
+        K(HB_BTN_SEL, (c->item[TOP.sel].flags & I_CHECKED) ? "untick" : "tick", 0);
+        K(HB_BTN_FX, br ? "unbrk" : "break", br ? 0 : "retire");
     }
+    K(HB_BTN_SAVE, "park", 0); K(HB_BTN_GLO, "terms", 0);
+    chrome(c->is_run ? "RUN" : "SESSION", "");
     lv_draw(TOP.sel);
 }
 
@@ -709,43 +799,48 @@ static void session_event(uint32_t kind, uint32_t id, int32_t arg)
     wo_ticket_t *c = &W.cur;
     int hand;
     (void)arg;
-    if (kind != HB_EV_BTN_DOWN || !W.has_cur) return;
-    hand = c->is_run && !c->run.ended && c->run.nhand;
+    if (!W.has_cur) return;
+    hand = session_hand();
+    if (kind == EV_HOLD) {
+        if (id == HB_BTN_FX && !hand && TOP.sel < c->nitems && !(c->item[TOP.sel].flags & I_BROKEN))
+            text_begin(TX_RETIRE, TOP.sel, 0, "RETIRE FOR GOOD: WHAT WAS WRONG?", "", WO_WHY);
+        return;
+    }
+    if (kind != HB_EV_BTN_DOWN) return;
     switch (id) {
     case HB_BTN_SEL:
         if (hand) { wo_take_card((uint8_t)TOP.sel); TOP.sel = (int16_t)(c->nitems - 1); wo_store_mark(ST_CUR); break; }
-        if (TOP.sel < c->nitems) {
+        if (TOP.sel >= 0 && TOP.sel < c->nitems) {
             int was = c->item[TOP.sel].flags & I_CHECKED;
-            if (!c->running && !was) { toast("Resume the clock to tick (LFO)"); break; }
+            if (!c->running && !was) { toast("Paused: PLAY resumes the clock"); break; }
             wo_tick((uint8_t)TOP.sel);
             if (!was) {
-                char b[24]; wo_strcpy(b, "+", 24); wo_catu(b, c->item[TOP.sel].pts, 24);
-                if (c->item[TOP.sel].flags & I_WASBROKEN) wo_strcpy(b, "Broken earlier: no points", 24);
+                char b[32]; wo_strcpy(b, "+", 32); wo_catu(b, c->item[TOP.sel].pts, 32);
+                if (c->item[TOP.sel].flags & I_WASBROKEN) wo_strcpy(b, "Broken earlier: no points", 32);
                 toast(b);
             }
             if (c->is_run && c->run.nhand) TOP.sel = 0;
             wo_store_mark(ST_CUR);
         }
         break;
-    case HB_BTN_REC: if (!hand && TOP.sel < c->nitems) text_begin(TX_BREAK, TOP.sel, 0, "WHY DID YOU BREAK IT?", "", WO_WHY); break;
-    case HB_BTN_FX: if (!hand && TOP.sel < c->nitems) text_begin(TX_RETIRE, TOP.sel, 0, "RETIRE: WHAT WAS WRONG?", "", WO_WHY); break;
-    case HB_BTN_ARP:
-        if (hand) { wo_redeal(); wo_store_mark(ST_CUR); toast(c->run.nhand ? "Dealt again" : "Nothing left to deal"); }
-        else if (TOP.sel < c->nitems && (c->item[TOP.sel].flags & I_BROKEN)) {
+    case HB_BTN_FX:
+        if (hand || TOP.sel < 0 || TOP.sel >= c->nitems) break;
+        if (c->item[TOP.sel].flags & I_BROKEN) {
             wo_unbreak((uint8_t)TOP.sel); wo_store_mark(ST_CUR);
             toast((c->item[TOP.sel].flags & I_WASBROKEN) ? "Unbroken, but it can no longer score" : "Unbroken");
-        }
+        } else text_begin(TX_BREAK, TOP.sel, 0, "WHY DID YOU BREAK IT?", "", WO_WHY);
         break;
-    case HB_BTN_LFO: wo_pause(); c->powered_off = 0; wo_store_mark(ST_CUR); toast(c->running ? "Clock running" : "Paused"); break;
+    case HB_BTN_REC:
+        if (hand) { wo_redeal(); wo_store_mark(ST_CUR); toast(c->run.nhand ? "Dealt again" : "Nothing left to deal"); }
+        break;
     case HB_BTN_SAVE: {
         int r = wo_park();
         toast(r == 0 ? "Ticket parked" : r == -1 ? "Both park slots are taken" : "Could not save it");
         if (!r) go_root(PG_HOME);
         break; }
-    case HB_BTN_EDIT: push(PG_RATE, 0); TOP.sel = 1; break;
     case HB_BTN_GLO:
         if (hand && TOP.sel < c->run.nhand) gloss_open(c->run.hand[TOP.sel].text, WO_POOL_SKEY[c->run.hand[TOP.sel].pool]);
-        else if (TOP.sel < c->nitems) gloss_open(c->item[TOP.sel].text, item_skey(&c->item[TOP.sel]));
+        else if (TOP.sel >= 0 && TOP.sel < c->nitems) gloss_open(c->item[TOP.sel].text, item_skey(&c->item[TOP.sel]));
         break;
     default: break;
     }
@@ -768,17 +863,19 @@ static void draw_rate(void)
     if (wo_burst(&W.cur)) wo_strcat(b, "  ticked in a burst", 64);
     lv_note(b, C(TC_DIM));
     lv_note("How did it go? Keepers teach the next rolls.", C(TC_DIM));
-    for (i = 0; i < 4; i++) lv_add(i, 16, 0, 0, TOP.sel == i ? "> " : "  ", RATES[i], i == 3 ? C(TC_MAGENTA) : C(TC_TEXT), C(TC_INK));
-    lv_add(4, 16, 0, 0, "Note: ", rate_note[0] ? rate_note : "(REC to write one)", C(TC_DIM), C(TC_INK));
-    chrome("CLOSE TICKET", " ", "SCL file it  REC note  HOME back");
+    for (i = 0; i < 4; i++) lv_add(i, 9, 0, 0, TOP.sel == i ? "> " : "  ", RATES[i], i == 3 ? C(TC_MAGENTA) : C(TC_TEXT), C(TC_INK));
+    lv_add(-1, 9, 0, 0, "Note: ", rate_note[0] ? rate_note : "(EDIT writes one)", C(TC_DIM), C(TC_INK));
+    keys_clear();
+    K(HB_BTN_HOME, "back", 0); K(HB_BTN_SEL, "FILE", 0); K(HB_BTN_EDIT, "note", 0);
+    chrome("FINISH TICKET", " ");
     lv_draw(TOP.sel);
 }
 static void rate_event(uint32_t kind, uint32_t id, int32_t arg)
 {
     (void)arg;
     if (kind != HB_EV_BTN_DOWN) return;
-    if (id == HB_BTN_REC || (id == HB_BTN_SEL && TOP.sel == 4)) { text_begin(TX_NOTE, 0, 0, "ONE LINE OF OUTCOME", rate_note, WO_WHY); return; }
-    if (id == HB_BTN_SEL && TOP.sel < 4) {
+    if (id == HB_BTN_EDIT) { text_begin(TX_NOTE, 0, 0, "ONE LINE OF OUTCOME", rate_note, WO_WHY); return; }
+    if (id == HB_BTN_SEL && TOP.sel >= 0 && TOP.sel < 4) {
         wo_synth_stop();
         wo_close((uint8_t)TOP.sel, rate_note);
         rate_note[0] = 0;
@@ -789,16 +886,17 @@ static void rate_event(uint32_t kind, uint32_t id, int32_t arg)
 }
 
 /* ================================================================ MODES */
-static int mode_order[WO_NMODES + WO_NMODECATS];
-static int build_mode_rows(void)
+static int mode_order[WO_NMODES];
+static void build_mode_rows(void)
 {
     char b[80], nm[32];
-    int c, m, n = 0, e = 0;
+    int c, m, e = 0;
     lv_reset();
+    lv_note("SCL starts a mode. Once picked, PLAY on any page starts it again.", C(TC_DIMMER));
     for (c = 0; c < WO_NMODECATS; c++) {
         wo_str(WO_MODECAT[c], nm, 32);
-        { int k; for (k = 0; nm[k]; k++) if (nm[k] >= 'a' && nm[k] <= 'z') nm[k] = (char)(nm[k] - 32); }
-        lv_add(-1, 4, 0, 0, "", nm, C(TC_CYAN), C(TC_INK));
+        upcase(nm);
+        lv_add(-1, 3, 0, 0, "", nm, C(TC_CYAN), C(TC_INK));
         for (m = 0; m < WO_NMODES; m++) {
             const wo_mode_t *md = &WO_MODES[m];
             int mult10, rules = 0, i;
@@ -806,46 +904,45 @@ static int build_mode_rows(void)
             mode_order[e] = m;
             wo_str(md->name, b, 80);
             mult10 = (int)(md->mult * 10.0f + 0.5f);
-            while (wo_strlen(b) < 20) wo_strcat(b, " ", 80);
+            while (wo_strlen(b) < 22) wo_strcat(b, " ", 80);
             wo_strcat(b, "x", 80); wo_catu(b, (uint32_t)(mult10 / 10), 80);
             if (mult10 % 10) { wo_strcat(b, ".", 80); wo_catu(b, (uint32_t)(mult10 % 10), 80); }
-            if (md->limit) { wo_strcat(b, " ", 80); wo_catu(b, md->limit, 80); wo_strcat(b, "m", 80); }
-            lv_add(e, 12, 0, 0, W.set.mode == m ? "* " : "  ", b, TOP.sel == e ? C(TC_SIGNAL) : C(TC_TEXT), C(TC_INK));
+            if (md->limit) { wo_strcat(b, "  ", 80); wo_catu(b, md->limit, 80); wo_strcat(b, " min", 80); }
+            lv_add(e, 9, 0, 0, W.set.mode == m ? "* " : "  ", b, TOP.sel == e ? C(TC_SIGNAL) : C(TC_TEXT), C(TC_INK));
             if (TOP.sel == e) {
                 wo_str(md->desc, tb, WO_LINE);
-                lv_add(e, 28, 0, 0, "", tb, C(TC_DIM), C(TC_INK));
+                lv_add(e, 21, 0, 0, "", tb, C(TC_DIM), C(TC_INK));
                 for (i = 0; i < WO_NENTRIES; i++) if (WO_ENTRIES[i].mode == m) rules++;
-                if (rules) { wo_strcpy(b, "", 80); wo_catu(b, (uint32_t)rules, 80); wo_strcat(b, " rules only this mode deals (EDIT)", 80); lv_add(e, 28, 0, 0, "", b, C(TC_DIMMER), C(TC_INK)); }
+                if (rules) { b[0] = 0; wo_catu(b, (uint32_t)rules, 80); wo_strcat(b, " rules only this mode deals (EDIT)", 80); lv_add(e, 21, 0, 0, "", b, C(TC_DIMMER), C(TC_INK)); }
             }
-            e++; n++;
+            e++;
         }
     }
-    return n;
 }
 static void draw_modes(void)
 {
     build_mode_rows();
-    chrome("MODES", " ", "SCL start  EDIT its rules");
+    keys_common();
+    K(HB_BTN_SEL, "start", 0); K(HB_BTN_EDIT, "rules", 0);
+    chrome("MODES", " ");
     lv_draw(TOP.sel);
 }
 static void modes_event(uint32_t kind, uint32_t id, int32_t arg)
 {
     int m;
     (void)arg;
-    if (kind != HB_EV_BTN_DOWN) return;
+    if (kind != HB_EV_BTN_DOWN || TOP.sel < 0) return;
     build_mode_rows();
-    m = mode_order[TOP.sel];
+    m = mode_order[TOP.sel % WO_NMODES];
     if (id == HB_BTN_SEL) {
-        if (W.has_cur && wo_park()) { toast("Park slots full: close a ticket first"); return; }
+        if (W.has_cur && wo_park()) { toast("Park slots full: finish a ticket first"); return; }
         wo_synth_stop();
         if (m == M_FREE) { W.set.mode = M_FREE; wo_store_mark(ST_STATE); go_root(PG_ROLL); toast("Free play: your own setup"); return; }
         wo_start_mode((uint8_t)m);
         wo_store_mark(ST_ALL);
         go_root(PG_SESSION);
         { char b[40]; mode_name((uint8_t)m, b, 32); wo_strcat(b, " started", 40); toast(b); }
-    } else if (id == HB_BTN_EDIT) {
-        push(PG_RULES, (int16_t)(1000 + m));
-    }
+    } else if (id == HB_BTN_EDIT) push(PG_RULES, (int16_t)(1000 + m));
 }
 
 /* ================================================================ PARKED */
@@ -858,24 +955,27 @@ static void draw_parked(void)
     for (k = 0; k < n; k++) {
         int s = wo_parked_slot(k);
         wo_hhmmss(tb2, wo_parked_elapsed(s), 24);
-        lv_add(k, 8, 0, 0, "", wo_parked_name(s), C(TC_TEXT), C(TC_INK));
+        lv_add(k, 6, 0, 0, "", wo_parked_name(s), C(TC_TEXT), C(TC_INK));
         wo_strcpy(b, "on the clock ", 64); wo_strcat(b, tb2, 64);
-        lv_add(k, 24, 0, 0, "", b, C(TC_DIM), C(TC_INK));
+        lv_add(k, 18, 0, 0, "", b, C(TC_DIM), C(TC_INK));
     }
-    chrome("PARKED", " ", "SCL resume  FX discard");
+    keys_common();
+    if (n) { K(HB_BTN_SEL, "resume", 0); K(HB_BTN_FX, "", "discrd"); }
+    chrome("PARKED", " ");
     lv_draw(TOP.sel);
 }
 static void parked_event(uint32_t kind, uint32_t id, int32_t arg)
 {
     int s;
     (void)arg;
-    if (kind != HB_EV_BTN_DOWN || TOP.sel >= wo_parked_count()) return;
+    if (TOP.sel < 0 || TOP.sel >= wo_parked_count()) return;
     s = wo_parked_slot(TOP.sel);
-    if (id == HB_BTN_SEL) {
+    if (kind == EV_HOLD && id == HB_BTN_FX) { wo_discard_parked(s); toast("Discarded"); return; }
+    if (kind == HB_EV_BTN_DOWN && id == HB_BTN_SEL) {
         int r = wo_unpark(s);
         if (r) { toast(r == -2 ? "No slot free for the ticket in play" : "Could not read it"); return; }
         go_root(PG_SESSION); toast("Resumed");
-    } else if (id == HB_BTN_FX && confirm(100 + s)) { wo_discard_parked(s); toast("Discarded"); }
+    }
 }
 
 /* ================================================================ LIBRARY and VIEW */
@@ -891,32 +991,40 @@ static void draw_library(void)
     char b[80];
     int i, n = wo_lib_count();
     lv_reset();
-    if (!n) lv_note("No filed tickets yet. Close a ticket (EDIT on the Session page) to file it.", C(TC_DIM));
+    if (!n) lv_note("No filed tickets yet. Hold PLAY on a ticket to finish and file it.", C(TC_DIM));
     for (i = 0; i < n; i++) {
         const wo_ticket_t *t = lib_ticket(i);
         if (!t) continue;
-        lv_add(i, 8, 0, 0, "", t->name, C(TC_TEXT), C(TC_INK));
-        if (TOP.sel == i || n <= 6) {
-            wo_strcpy(b, RATES[t->rating & 3], 80); wo_strcat(b, "  ", 80); wo_catu(b, t->score, 80); wo_strcat(b, " pts  ", 80);
+        b[0] = 0;
+        wo_catu(b, t->score, 80);
+        while (wo_strlen(b) < 6) wo_strcat(b, " ", 80);
+        wo_strcat(b, t->name, 80);
+        lv_nowrap = 1;
+        lv_add(i, 6, 0, 0, "", b, TOP.sel == i ? C(TC_SIGNAL) : C(TC_TEXT), C(TC_INK));
+        if (TOP.sel == i) {
+            wo_strcpy(b, RATES[t->rating & 3], 80); wo_strcat(b, "  ", 80);
             wo_hhmmss(tb2, t->elapsed, 24); wo_strcat(b, tb2, 80);
             if (t->is_run) wo_strcat(b, t->run.won ? "  run won" : "  run lost", 80);
-            lv_add(i, 24, 0, 0, "", b, C(TC_DIM), C(TC_INK));
-            if (t->note[0] && TOP.sel == i) lv_add(i, 24, 0, 0, "\"", t->note, C(TC_DIMMER), C(TC_INK));
+            lv_add(i, 42, 0, 0, "", b, C(TC_DIM), C(TC_INK));
+            if (t->note[0]) lv_add(i, 42, 0, 0, "\"", t->note, C(TC_DIMMER), C(TC_INK));
         }
     }
-    chrome("LIBRARY", " ", "SCL view  ARP reissue  FX delete");
+    keys_common();
+    if (n) { K(HB_BTN_SEL, "view", 0); K(HB_BTN_REC, "again", 0); K(HB_BTN_FX, "", "delete"); }
+    chrome("LIBRARY", " ");
     lv_draw(TOP.sel);
 }
 static void library_event(uint32_t kind, uint32_t id, int32_t arg)
 {
     (void)arg;
-    if (kind != HB_EV_BTN_DOWN || TOP.sel >= wo_lib_count()) return;
+    if (TOP.sel < 0 || TOP.sel >= wo_lib_count()) return;
+    if (kind == EV_HOLD && id == HB_BTN_FX) { wo_lib_delete(TOP.sel); libt_idx = -1; toast("Deleted"); return; }
+    if (kind != HB_EV_BTN_DOWN) return;
     if (id == HB_BTN_SEL) push(PG_VIEW, TOP.sel);
-    else if (id == HB_BTN_FX && confirm(200 + TOP.sel)) { wo_lib_delete(TOP.sel); libt_idx = -1; toast("Deleted"); }
-    else if (id == HB_BTN_ARP) {
+    else if (id == HB_BTN_REC) {                    /* the same ticket again, every box empty */
         const wo_ticket_t *t = lib_ticket(TOP.sel);
         int i;
-        if (!t || t->is_run) { toast("A run can't be reissued"); return; }
+        if (!t || t->is_run) { toast("A run can't be started again"); return; }
         if (W.has_cur && wo_park()) { toast("Park slots full"); return; }
         W.cur = *t;
         W.cur.id = W.next_id++;
@@ -930,7 +1038,7 @@ static void library_event(uint32_t kind, uint32_t id, int32_t arg)
         }
         W.has_cur = 1; W.set.mode = W.cur.mode;
         wo_store_mark(ST_CUR | ST_STATE);
-        go_root(PG_SESSION); toast("Reissued");
+        go_root(PG_SESSION); toast("Started again");
     }
 }
 static void draw_view(void)
@@ -939,20 +1047,29 @@ static void draw_view(void)
     char b[80];
     int i;
     lv_reset();
-    if (!t) { lv_note("Could not read this ticket.", C(TC_SIGNAL)); chrome("TICKET", " ", "HOME back"); lv_draw(-1); return; }
+    keys_common();
+    if (!t) { lv_note("Could not read this ticket.", C(TC_SIGNAL)); chrome("TICKET", " "); lv_draw(-1); return; }
     lv_note(t->name, C(TC_DIM));
     wo_strcpy(b, RATES[t->rating & 3], 80); wo_strcat(b, "  ", 80); wo_catu(b, t->score, 80); wo_strcat(b, " pts", 80);
     lv_note(b, C(TC_TEXT));
-    if (t->note[0]) lv_add(-1, 4, 0, 0, "\"", t->note, C(TC_DIM), C(TC_INK));
+    if (t->note[0]) lv_add(-1, 3, 0, 0, "\"", t->note, C(TC_DIM), C(TC_INK));
     for (i = 0; i < t->nitems; i++) {
         const wo_item_t *it = &t->item[i];
-        lv_add(i, 16, it->tier < 3 ? TIERCH[it->tier] : 0, tier_col(it->tier),
+        lv_add(i, 4, it->tier < 3 ? TIERCH[it->tier] : 0, tier_col(it->tier),
                (it->flags & I_BROKEN) ? "[/] " : (it->flags & I_CHECKED) ? "[x] " : "[ ] ", it->text,
                (it->flags & I_BROKEN) ? C(TC_DIMMER) : C(TC_TEXT), C(TC_INK));
-        if (it->flags & I_BROKEN) { wo_strcpy(b, "broke it: ", 80); wo_strcat(b, it->why, 80); lv_add(i, 48, 0, 0, "", b, C(TC_MAGENTA), C(TC_INK)); }
+        if (it->flags & I_BROKEN) { wo_strcpy(b, "broke it: ", 80); wo_strcat(b, it->why, 80); lv_add(i, 37, 0, 0, "", b, C(TC_MAGENTA), C(TC_INK)); }
     }
-    chrome("TICKET", " ", "SELECT move  GLO terms");
+    K(HB_BTN_GLO, "terms", 0);
+    chrome("TICKET", " ");
     lv_draw(TOP.sel);
+}
+static void view_event(uint32_t kind, uint32_t id, int32_t arg)
+{
+    const wo_ticket_t *t = lib_ticket(TOP.arg);
+    (void)arg;
+    if (kind == HB_EV_BTN_DOWN && id == HB_BTN_GLO && t && TOP.sel >= 0 && TOP.sel < t->nitems)
+        gloss_open(t->item[TOP.sel].text, item_skey(&t->item[TOP.sel]));
 }
 
 /* ================================================================ SCORES */
@@ -967,30 +1084,33 @@ static void draw_scores(void)
     for (i = 0; i < n; i++) { total += W.score[ord[i]].score; if (W.score[ord[i]].score > best) best = W.score[ord[i]].score; }
     lv_reset();
     if (filt < 0) wo_strcpy(mn, "All modes", 32); else mode_name((uint8_t)filt, mn, 32);
-    wo_strcpy(b, mn, 80); wo_strcat(b, ": ", 80); wo_catu(b, (uint32_t)n, 80); wo_strcat(b, " | best ", 80);
-    wo_catu(b, best, 80); wo_strcat(b, " | total ", 80); wo_catu(b, total, 80);
+    wo_strcpy(b, mn, 80); wo_strcat(b, " (ALGO): ", 80); wo_catu(b, (uint32_t)n, 80); wo_strcat(b, ", best ", 80);
+    wo_catu(b, best, 80); wo_strcat(b, ", total ", 80); wo_catu(b, total, 80);
     lv_note(b, C(TC_CYAN));
     for (i = 0; i < n; i++) {
         const wo_score_t *s = &W.score[ord[i]];
         b[0] = 0;
         wo_catu(b, s->score, 80);
         while (wo_strlen(b) < 6) wo_strcat(b, " ", 80);
-        mode_name(s->mode, mn, 32); mn[12] = 0; wo_strcat(b, mn, 80);
-        wo_strcat(b, " #", 80); wo_catu(b, s->id, 80);
-        lv_add(i, 8, 0, 0, "", b, i == 0 ? C(TC_SIGNAL) : C(TC_TEXT), C(TC_INK));
+        mode_name(s->mode, mn, 32); mn[16] = 0; wo_strcat(b, mn, 80);
+        while (wo_strlen(b) < 24) wo_strcat(b, " ", 80);
+        wo_strcat(b, RATES[s->rating & 3], 80);
+        lv_add(i, 6, 0, 0, "", b, i == 0 ? C(TC_SIGNAL) : C(TC_TEXT), C(TC_INK));
         if (TOP.sel == i) {
-            wo_strcpy(b, RATES[s->rating & 3], 80); wo_strcat(b, "  ", 80); wo_catu(b, s->done, 80); wo_strcat(b, "/", 80); wo_catu(b, s->total, 80);
+            b[0] = 0; wo_catu(b, s->done, 80); wo_strcat(b, "/", 80); wo_catu(b, s->total, 80);
             wo_strcat(b, " ticked  ", 80); wo_hhmmss(tb2, s->ms, 24); wo_strcat(b, tb2, 80);
-            lv_add(i, 24, 0, 0, "", b, C(TC_DIM), C(TC_INK));
+            if (s->run_total) { wo_strcat(b, s->run_won ? "  run won" : "  run lost at round ", 80); if (!s->run_won) wo_catu(b, s->run_reached, 80); }
+            lv_add(i, 42, 0, 0, "", b, C(TC_DIM), C(TC_INK));
             b[0] = 0;
-            if (s->run_total) { wo_strcat(b, s->run_won ? "run won  " : "run lost at round ", 80); if (!s->run_won) { wo_catu(b, s->run_reached, 80); wo_strcat(b, "  ", 80); } }
             if (s->burst) wo_strcat(b, "ticked in a burst  ", 80);
             if (s->pauses) { wo_catu(b, s->pauses, 80); wo_strcat(b, " pauses", 80); }
-            if (b[0]) lv_add(i, 24, 0, 0, "", b, C(TC_MAGENTA), C(TC_INK));
-            lv_add(i, 24, 0, 0, "", s->name, C(TC_DIMMER), C(TC_INK));
+            if (b[0]) lv_add(i, 42, 0, 0, "", b, C(TC_MAGENTA), C(TC_INK));
+            lv_add(i, 42, 0, 0, "", s->name, C(TC_DIMMER), C(TC_INK));
         }
     }
-    chrome("SCORES", " ", "ALGO mode  FX clear");
+    keys_common();
+    if (W.nscores) K(HB_BTN_FX, "", "clear");
+    chrome("SCORES", " ");
     lv_draw(TOP.sel);
 }
 static void scores_event(uint32_t kind, uint32_t id, int32_t arg)
@@ -999,7 +1119,7 @@ static void scores_event(uint32_t kind, uint32_t id, int32_t arg)
         int a = TOP.arg + (arg > 0 ? 1 : -1);
         TOP.arg = (int16_t)((a + WO_NMODES + 1) % (WO_NMODES + 1));
         TOP.sel = 0; TOP.scroll = 0;
-    } else if (kind == HB_EV_BTN_DOWN && id == HB_BTN_FX && confirm(300)) {
+    } else if (kind == EV_HOLD && id == HB_BTN_FX) {
         W.nscores = 0; wo_store_mark(ST_SCORES); toast("Scores cleared. Filed tickets stay.");
     }
 }
@@ -1024,32 +1144,39 @@ static void draw_rules(void)
         for (i = a; i < a + n && nrule_ids < 260; i++) { rule_ids[nrule_ids++] = (int16_t)i; off += wo_bit(W.disabled, (uint32_t)i); }
         for (i = 0; i < W.ncustom && nrule_ids < 260; i++) if (W.custom[i].pool == rpool && W.custom[i].tier == rtier) { rule_ids[nrule_ids++] = (int16_t)(10000 + i); yours++; }
         b[0] = 0; wo_catu(b, (uint32_t)nrule_ids, 80); wo_strcat(b, " rules, ", 80); wo_catu(b, (uint32_t)off, 80);
-        wo_strcat(b, " off, ", 80); wo_catu(b, (uint32_t)yours, 80); wo_strcat(b, " yours", 80);
+        wo_strcat(b, " off, ", 80); wo_catu(b, (uint32_t)yours, 80); wo_strcat(b, " yours. ALGO pool, KNOB2 severity", 80);
         lv_note(b, C(TC_DIM));
     }
     for (i = 0; i < nrule_ids; i++) {
         int id = rule_ids[i];
         if (id >= 10000) {
-            lv_add(i, 16, TIERCH[rtier], tier_col(rtier), "+ ", W.custom[id - 10000].text, C(TC_CYAN), C(TC_INK));
+            lv_add(i, 4, TIERCH[rtier], tier_col(rtier), "+ ", W.custom[id - 10000].text, C(TC_CYAN), C(TC_INK));
         } else {
             const wo_entry_t *e = &WO_ENTRIES[id];
             int dis = wo_bit(W.disabled, (uint32_t)id);
-            char pre[28] = "";
+            char pre[32] = "";
             wo_str(e->text, tb, WO_LINE);
-            if (mode >= 0) { wo_pool_name(e->pool, pl, 24); wo_strcat(pre, pl, 28); wo_strcat(pre, ": ", 28); }
-            else if (e->mode != NONE8) { mode_name(e->mode, pl, 24); pl[10] = 0; wo_strcat(pre, pl, 28); wo_strcat(pre, ": ", 28); }
-            if (e->genre != NONE8) { wo_str(WO_GENRE[e->genre], pl, 24); wo_strcat(pre, pl, 28); wo_strcat(pre, ": ", 28); }
-            if (dis) wo_strcat(pre, "off ", 28);
-            lv_add(i, 16, TIERCH[e->tier], dis ? C(TC_DIMMER) : tier_col(e->tier), pre, tb, dis ? C(TC_DIMMER) : C(TC_TEXT), C(TC_INK));
+            if (mode >= 0) { wo_pool_name(e->pool, pl, 24); wo_strcat(pre, pl, 32); wo_strcat(pre, ": ", 32); }
+            else if (e->mode != NONE8) { mode_name(e->mode, pl, 24); pl[12] = 0; wo_strcat(pre, pl, 32); wo_strcat(pre, ": ", 32); }
+            if (e->genre != NONE8) { wo_str(WO_GENRE[e->genre], pl, 24); wo_strcat(pre, pl, 32); wo_strcat(pre, ": ", 32); }
+            if (dis) wo_strcat(pre, "off ", 32);
+            lv_add(i, 4, TIERCH[e->tier], dis ? C(TC_DIMMER) : tier_col(e->tier), pre, tb, dis ? C(TC_DIMMER) : C(TC_TEXT), C(TC_INK));
         }
     }
-    if (mode >= 0) chrome("MODE RULES", " ", "EDIT on/off  GLO terms");
+    keys_common();
+    K(HB_BTN_GLO, "terms", 0);
+    if (TOP.sel >= 0 && TOP.sel < nrule_ids) {
+        if (rule_ids[TOP.sel] >= 10000) { K(HB_BTN_EDIT, "edit", 0); K(HB_BTN_FX, "", "delete"); }
+        else K(HB_BTN_EDIT, "on/off", 0);
+    }
+    if (mode < 0) K(HB_BTN_REC, "add", 0);
+    if (mode >= 0) chrome("MODE RULES", " ");
     else {
         char t[40];
         wo_pool_name(rpool, t, 24);
-        { int k; for (k = 0; t[k]; k++) if (t[k] >= 'a' && t[k] <= 'z') t[k] = (char)(t[k] - 32); }
+        upcase(t);
         wo_strcat(t, " ", 40); wo_strcat(t, wo_tier_name(rtier), 40);
-        chrome(t, " ", "ALGO pool KNOB2 sev REC add");
+        chrome(t, " ");
     }
     lv_draw(TOP.sel);
 }
@@ -1061,29 +1188,26 @@ static void rules_event(uint32_t kind, uint32_t id, int32_t arg)
         else if (id == HB_ENC_KNOB2) { rtier = (uint8_t)((rtier + (arg > 0 ? 1 : 2)) % 3); TOP.sel = 0; TOP.scroll = 0; }
         return;
     }
-    if (kind != HB_EV_BTN_DOWN) return;
-    rid = TOP.sel < nrule_ids ? rule_ids[TOP.sel] : -1;
-    switch (id) {
-    case HB_BTN_EDIT:
-        if (rid >= 0 && rid < 10000) { wo_setbit(W.disabled, (uint32_t)rid, !wo_bit(W.disabled, (uint32_t)rid)); wo_store_mark(ST_STATE); }
-        else if (rid >= 10000) toast("Yours: FX deletes it");
-        break;
-    case HB_BTN_REC:
-        if (mode >= 0) break;
-        if (W.ncustom >= WO_MAXCUSTOM) { toast("48 rules of your own is the most"); break; }
-        text_begin(TX_CUSTOM_NEW, rpool, rtier, "YOUR RULE ({MAT} etc. work)", "", WO_CUSTOMLEN);
-        break;
-    case HB_BTN_SEL:
-        if (rid >= 10000) text_begin(TX_CUSTOM_EDIT, rid - 10000, 0, "EDIT YOUR RULE", W.custom[rid - 10000].text, WO_CUSTOMLEN);
-        else toast("Stock rules switch on and off (EDIT)");
-        break;
-    case HB_BTN_FX:
-        if (rid >= 10000 && confirm(400 + rid)) {
+    rid = TOP.sel >= 0 && TOP.sel < nrule_ids ? rule_ids[TOP.sel] : -1;
+    if (kind == EV_HOLD) {
+        if (id == HB_BTN_FX && rid >= 10000) {
             int k = rid - 10000;
             for (; k < W.ncustom - 1; k++) W.custom[k] = W.custom[k + 1];
             W.ncustom--;
             wo_store_mark(ST_CUSTOM); toast("Deleted");
         }
+        return;
+    }
+    if (kind != HB_EV_BTN_DOWN) return;
+    switch (id) {
+    case HB_BTN_EDIT:
+        if (rid >= 10000) text_begin(TX_CUSTOM_EDIT, rid - 10000, 0, "EDIT YOUR RULE", W.custom[rid - 10000].text, WO_CUSTOMLEN);
+        else if (rid >= 0) { wo_setbit(W.disabled, (uint32_t)rid, !wo_bit(W.disabled, (uint32_t)rid)); wo_store_mark(ST_STATE); }
+        break;
+    case HB_BTN_REC:
+        if (mode >= 0) break;
+        if (W.ncustom >= WO_MAXCUSTOM) { toast("48 rules of your own is the most"); break; }
+        text_begin(TX_CUSTOM_NEW, rpool, rtier, "YOUR RULE ({MAT}, {DEV}... work)", "", WO_CUSTOMLEN);
         break;
     case HB_BTN_GLO:
         if (rid >= 10000) gloss_open(W.custom[rid - 10000].text, WO_POOL_SKEY[rpool]);
@@ -1100,34 +1224,39 @@ static void role_of(uint8_t roles, char *o, int cap)
     o[0] = 0;
     for (r = 0; r < WO_NROLES; r++) if (roles >> r & 1u) { char b[24]; if (o[0]) wo_strcat(o, "+", cap); wo_str(WO_ROLE[r], b, 24); wo_strcat(o, b, cap); }
 }
+/* entry 0 opens the categories page; the items follow from 1 */
 static void draw_gear(void)
 {
-    char b[64], rl[40];
+    char b[80], rl[40];
     int i, on = 0;
     for (i = 0; i < W.ninv; i++) on += wo_inv_on((uint8_t)i);
     lv_reset();
-    wo_strcpy(b, "", 64); wo_catu(b, (uint32_t)on, 64); wo_strcat(b, " of ", 64); wo_catu(b, W.ninv, 64);
-    wo_strcat(b, " on. SEQ: what each category feeds.", 64);
+    b[0] = 0; wo_catu(b, (uint32_t)on, 80); wo_strcat(b, " of ", 80); wo_catu(b, W.ninv, 80); wo_strcat(b, " on. ALGO sets an item's category.", 80);
     lv_note(b, C(TC_DIM));
+    lv_add(0, 6, 0, 0, "", "> What each category can be named in", TOP.sel == 0 ? C(TC_SIGNAL) : C(TC_CYAN), C(TC_INK));
     for (i = 0; i < W.ninv; i++) {
         int l;
-        wo_strcpy(b, W.inv[i].name, 64);
+        wo_strcpy(b, W.inv[i].name, 80);
         role_of(W.inv[i].roles, rl, 40);
-        l = 28 - wo_strlen(rl) - 1;
+        l = 37 - wo_strlen(rl) - 1;
         if (l < 4) l = 4;
-        while (wo_strlen(b) < l) wo_strcat(b, " ", 64);
+        while (wo_strlen(b) < l) wo_strcat(b, " ", 80);
         b[l] = 0;
-        wo_strcat(b, " ", 64); wo_strcat(b, rl, 64);
+        wo_strcat(b, " ", 80); wo_strcat(b, rl, 80);
         lv_nowrap = 1;
-        lv_add(i, 8, 0, 0, W.inv[i].on ? "" : "", b, W.inv[i].on ? C(TC_TEXT) : C(TC_DIMMER), C(TC_INK));
+        lv_add(i + 1, 6, 0, 0, "", b, W.inv[i].on ? C(TC_TEXT) : C(TC_DIMMER), C(TC_INK));
     }
-    chrome("GEAR", " ", "EDIT on/off ALGO role SCL name");
+    keys_common();
+    K(HB_BTN_REC, "add", 0);
+    if (TOP.sel == 0) K(HB_BTN_SEL, "open", 0);
+    else if (TOP.sel > 0 && TOP.sel <= W.ninv) { K(HB_BTN_SEL, "rename", 0); K(HB_BTN_EDIT, "on/off", 0); K(HB_BTN_FX, "", "delete"); }
+    chrome("GEAR", " ");
     lv_draw(TOP.sel);
 }
 static void gear_event(uint32_t kind, uint32_t id, int32_t arg)
 {
-    int i = TOP.sel;
-    if (kind == HB_EV_ENC && id == HB_ENC_ALGORITHM && i < W.ninv) {
+    int i = TOP.sel - 1;
+    if (kind == HB_EV_ENC && id == HB_ENC_ALGORITHM && i >= 0 && i < W.ninv) {
         int r = 0, k;
         for (k = 0; k < WO_NROLES; k++) if (W.inv[i].roles >> k & 1u) { r = k; break; }
         r = (r + (arg > 0 ? 1 : WO_NROLES - 1)) % WO_NROLES;
@@ -1135,61 +1264,66 @@ static void gear_event(uint32_t kind, uint32_t id, int32_t arg)
         wo_store_mark(ST_STATE);
         return;
     }
-    if (kind != HB_EV_BTN_DOWN) return;
-    switch (id) {
-    case HB_BTN_EDIT: if (i < W.ninv) { W.inv[i].on = !W.inv[i].on; wo_store_mark(ST_STATE); } break;
-    case HB_BTN_SEL: if (i < W.ninv) text_begin(TX_INV_RENAME, i, 0, "RENAME", W.inv[i].name, WO_NAMELEN); break;
-    case HB_BTN_REC:
-        if (W.ninv >= WO_MAXINV) { toast("64 items is the most"); break; }
-        text_begin(TX_INV_NEW, 0, 0, "NEW GEAR (ALGO sets its role)", "", WO_NAMELEN);
-        break;
-    case HB_BTN_FX:
-        if (i < W.ninv && confirm(500 + i)) {
+    if (kind == EV_HOLD) {
+        if (id == HB_BTN_FX && i >= 0 && i < W.ninv) {
             int k;
-            if (W.has_draft) W.has_draft = 0;          /* the draft names gear by number */
+            W.has_draft = 0;                    /* the draft names gear by number */
             for (k = i; k < W.ninv - 1; k++) W.inv[k] = W.inv[k + 1];
             W.ninv--;
             for (k = i; k < WO_MAXINV - 1; k++) W.weight[WK_ITEM + k] = W.weight[WK_ITEM + k + 1];
             wo_store_mark(ST_STATE | ST_DRAFT); toast("Deleted");
         }
+        return;
+    }
+    if (kind != HB_EV_BTN_DOWN) return;
+    switch (id) {
+    case HB_BTN_EDIT: if (i >= 0 && i < W.ninv) { W.inv[i].on = !W.inv[i].on; wo_store_mark(ST_STATE); } break;
+    case HB_BTN_SEL:
+        if (TOP.sel == 0) push(PG_BUCKETS, 0);
+        else if (i >= 0 && i < W.ninv) text_begin(TX_INV_RENAME, i, 0, "RENAME", W.inv[i].name, WO_NAMELEN);
         break;
-    case HB_BTN_SEQ: push(PG_BUCKETS, 0); break;
+    case HB_BTN_REC:
+        if (W.ninv >= WO_MAXINV) { toast("64 items is the most"); break; }
+        text_begin(TX_INV_NEW, 0, 0, "NEW GEAR (then ALGO sets its category)", "", WO_NAMELEN);
+        break;
     default: break;
     }
 }
-static int bucket_cur;
+static int bucket_cur = F_GEAR;
 static void draw_buckets(void)
 {
-    char b[80], fn[24];
+    char b[96], fn[24];
     int r, f;
     lv_reset();
-    lv_note("Which parameters each category of gear can be named in.", C(TC_DIM));
+    lv_note("Which parameters each category of gear can be named in. KNOB1 picks one, EDIT switches it.", C(TC_DIM));
     for (r = 0; r < WO_NROLES; r++) {
-        wo_str(WO_ROLE[r], b, 80);
-        wo_strcat(b, ": ", 80);
+        wo_str(WO_ROLE[r], b, 96);
+        wo_strcat(b, ": ", 96);
         if (TOP.sel != r) {
             int any = 0;
-            for (f = 0; f < WO_NFIELDS; f++) if (W.bucket[r] >> f & 1u) { if (any) wo_strcat(b, ", ", 80); wo_field_name((uint8_t)f, fn, 24); wo_strcat(b, fn, 80); any = 1; }
-            if (!any) wo_strcat(b, "nothing", 80);
-            lv_add(r, 8, 0, 0, "", b, C(TC_TEXT), C(TC_INK));
+            for (f = 0; f < WO_NFIELDS; f++) if (W.bucket[r] >> f & 1u) { if (any) wo_strcat(b, ", ", 96); wo_field_name((uint8_t)f, fn, 24); wo_strcat(b, fn, 96); any = 1; }
+            if (!any) wo_strcat(b, "nothing", 96);
+            lv_add(r, 6, 0, 0, "", b, C(TC_TEXT), C(TC_INK));
         } else {
-            lv_add(r, 8, 0, 0, "", b, C(TC_SIGNAL), C(TC_INK));
+            lv_add(r, 6, 0, 0, "", b, C(TC_SIGNAL), C(TC_INK));
             for (f = 0; f < WO_NFIELDS; f++) {
                 if (f == F_KEY || f == F_TEMPO) continue;
                 wo_field_name((uint8_t)f, fn, 24);
-                wo_strcpy(b, (W.bucket[r] >> f & 1u) ? "[x] " : "[ ] ", 80); wo_strcat(b, fn, 80);
-                lv_add(r, 24, 0, 0, bucket_cur == f ? "> " : "  ", b, bucket_cur == f ? C(TC_SIGNAL) : C(TC_TEXT), C(TC_INK));
+                wo_strcpy(b, (W.bucket[r] >> f & 1u) ? "[x] " : "[ ] ", 96); wo_strcat(b, fn, 96);
+                lv_add(r, 18, 0, 0, bucket_cur == f ? "> " : "  ", b, bucket_cur == f ? C(TC_SIGNAL) : C(TC_TEXT), C(TC_INK));
             }
         }
     }
-    chrome("CATEGORIES", " ", "KNOB1 param  EDIT feeds it");
+    keys_common();
+    K(HB_BTN_EDIT, "switch", 0);
+    chrome("CATEGORIES", " ");
     lv_draw(TOP.sel);
 }
 static void buckets_event(uint32_t kind, uint32_t id, int32_t arg)
 {
     if (kind == HB_EV_ENC && id == HB_ENC_KNOB1) {
         do bucket_cur = (bucket_cur + (arg > 0 ? 1 : WO_NFIELDS - 1)) % WO_NFIELDS; while (bucket_cur == F_KEY || bucket_cur == F_TEMPO);
-    } else if (kind == HB_EV_BTN_DOWN && id == HB_BTN_EDIT && TOP.sel < WO_NROLES) {
+    } else if (kind == HB_EV_BTN_DOWN && id == HB_BTN_EDIT && TOP.sel >= 0 && TOP.sel < WO_NROLES) {
         W.bucket[TOP.sel] ^= 1u << bucket_cur; wo_store_mark(ST_STATE);
     }
 }
@@ -1205,36 +1339,44 @@ static void draw_mats(void)
     lv_note("What {MAT} and {MATCAT} can name.", C(TC_DIM));
     for (c = 0; c < WO_NMATCATS; c++) {
         wo_str(WO_MATCAT[c], b, 64);
-        { int k; for (k = 0; b[k]; k++) if (b[k] >= 'a' && b[k] <= 'z') b[k] = (char)(b[k] - 32); }
-        lv_add(-1, 4, 0, 0, "", b, C(TC_CYAN), C(TC_INK));
+        upcase(b);
+        lv_add(-1, 3, 0, 0, "", b, C(TC_CYAN), C(TC_INK));
         for (i = WO_MAT_START[c]; i < WO_MAT_START[c + 1]; i++) {
             int off = wo_bit(W.matoff, (uint32_t)i);
             wo_str(WO_MAT[i], b, 64);
             mat_ids[nmat_ids] = (int16_t)i; mat_cat[nmat_ids] = (uint8_t)c;
-            lv_add(nmat_ids++, 16, 0, 0, off ? "off " : "", b, off ? C(TC_DIMMER) : C(TC_TEXT), C(TC_INK));
+            lv_add(nmat_ids++, 12, 0, 0, off ? "off " : "", b, off ? C(TC_DIMMER) : C(TC_TEXT), C(TC_INK));
         }
         for (i = 0; i < W.nmatadd; i++) if (W.matadd[i].cat == c) {
             mat_ids[nmat_ids] = (int16_t)(1000 + i); mat_cat[nmat_ids] = (uint8_t)c;
-            lv_add(nmat_ids++, 16, 0, 0, "+ ", W.matadd[i].text, C(TC_CYAN), C(TC_INK));
+            lv_add(nmat_ids++, 12, 0, 0, "+ ", W.matadd[i].text, C(TC_CYAN), C(TC_INK));
         }
     }
-    chrome("MATERIALS", " ", "EDIT on/off REC add FX del");
+    keys_common();
+    K(HB_BTN_REC, "add", 0);
+    if (TOP.sel >= 0 && TOP.sel < nmat_ids) {
+        if (mat_ids[TOP.sel] >= 1000) K(HB_BTN_FX, "", "delete"); else K(HB_BTN_EDIT, "on/off", 0);
+    }
+    chrome("MATERIALS", " ");
     lv_draw(TOP.sel);
 }
 static void mats_event(uint32_t kind, uint32_t id, int32_t arg)
 {
     int m;
     (void)arg;
-    if (kind != HB_EV_BTN_DOWN || TOP.sel >= nmat_ids) return;
+    if (TOP.sel < 0 || TOP.sel >= nmat_ids) return;
     m = mat_ids[TOP.sel];
+    if (kind == EV_HOLD && id == HB_BTN_FX && m >= 1000) {
+        int k;
+        for (k = m - 1000; k < W.nmatadd - 1; k++) W.matadd[k] = W.matadd[k + 1];
+        W.nmatadd--; wo_store_mark(ST_CUSTOM); toast("Deleted");
+        return;
+    }
+    if (kind != HB_EV_BTN_DOWN) return;
     if (id == HB_BTN_EDIT && m < 1000) { wo_setbit(W.matoff, (uint32_t)m, !wo_bit(W.matoff, (uint32_t)m)); wo_store_mark(ST_STATE); }
     else if (id == HB_BTN_REC) {
         if (W.nmatadd >= WO_MAXMATADD) toast("32 of your own is the most");
         else text_begin(TX_MAT_NEW, mat_cat[TOP.sel], 0, "A SOUND TO SAMPLE", "", WO_MATLEN);
-    } else if (id == HB_BTN_FX && m >= 1000 && confirm(600 + m)) {
-        int k;
-        for (k = m - 1000; k < W.nmatadd - 1; k++) W.matadd[k] = W.matadd[k + 1];
-        W.nmatadd--; wo_store_mark(ST_CUSTOM); toast("Deleted");
     }
 }
 
@@ -1246,16 +1388,18 @@ static void draw_presets(void)
     lv_note("Starting points for the Roll page.", C(TC_DIM));
     for (i = 0; i < WO_NBUILTIN; i++) {
         wo_str(WO_BUILTIN[i].name, tb2, 64);
-        lv_add(i, 8, 0, 0, "", tb2, TOP.sel == i ? C(TC_SIGNAL) : C(TC_TEXT), C(TC_INK));
-        if (TOP.sel == i) { wo_str(WO_BUILTIN[i].desc, tb, WO_LINE); lv_add(i, 24, 0, 0, "", tb, C(TC_DIM), C(TC_INK)); }
+        lv_add(i, 6, 0, 0, "", tb2, TOP.sel == i ? C(TC_SIGNAL) : C(TC_TEXT), C(TC_INK));
+        if (TOP.sel == i) { wo_str(WO_BUILTIN[i].desc, tb, WO_LINE); lv_add(i, 18, 0, 0, "", tb, C(TC_DIM), C(TC_INK)); }
     }
-    chrome("PRESETS", " ", "SCL use it");
+    keys_common();
+    K(HB_BTN_SEL, "use", 0);
+    chrome("PRESETS", " ");
     lv_draw(TOP.sel);
 }
 static void presets_event(uint32_t kind, uint32_t id, int32_t arg)
 {
     (void)arg;
-    if (kind == HB_EV_BTN_DOWN && id == HB_BTN_SEL && TOP.sel < WO_NBUILTIN) {
+    if (kind == HB_EV_BTN_DOWN && id == HB_BTN_SEL && TOP.sel >= 0 && TOP.sel < WO_NBUILTIN) {
         wo_apply_builtin((uint8_t)TOP.sel);
         W.set.mode = M_FREE;
         wo_store_mark(ST_STATE | ST_DRAFT);
@@ -1268,9 +1412,9 @@ static void presets_event(uint32_t kind, uint32_t id, int32_t arg)
 enum { S_THEME, S_ANCHOR, S_GENRE, S_COOL, S_CLASH, S_ROLLSIZE, S_MUTN, S_TARGET, S_RMIN, S_RMAX, S_RSEV, S_CHAOS,
        S_HOLDS, S_RANCHOR, S_SOUND, S_VOL, S_RESETW, S_WIPE, S_ABOUT, S_N };
 static const char *const SNAME[S_N] = {"Theme", "Anchor", "Genre lock", "Cooldown", "No clashes", "Roll size", "Mutate",
-                                       "Target time", "Random: min", "Random: max", "Random: sev", "Random: chaos",
-                                       "Random: holds", "Random: anchor", "Sound", "Volume", "Reset learning",
-                                       "Reset everything", "About"};
+                                       "Target time", "Random: fewest params", "Random: most params", "Random: severity",
+                                       "Random: chaos", "Random: held params", "Random: anchor", "Sound", "Volume",
+                                       "Reset learning", "Reset everything", "About"};
 static void setting_value(int s, char *o, int cap)
 {
     static const char *const RS[7] = {"any", "any", "escalate", "ladder", "gentle", "firm", "brutal"};
@@ -1292,7 +1436,7 @@ static void setting_value(int s, char *o, int cap)
     case S_RANCHOR: wo_strcpy(o, W.set.ranchor ? "rolled" : "kept", cap); break;
     case S_SOUND: wo_strcpy(o, W.set.sound ? "on" : "off", cap); break;
     case S_VOL: wo_catu(o, W.set.volume, cap); break;
-    case S_RESETW: case S_WIPE: wo_strcpy(o, "SCL x2", cap); break;
+    case S_RESETW: case S_WIPE: wo_strcpy(o, "hold FX", cap); break;
     case S_ABOUT: wo_strcpy(o, WO_BUILD, cap); break;
     default: break;
     }
@@ -1306,17 +1450,20 @@ static void draw_settings(void)
         int l;
         wo_strcpy(b, SNAME[s], 64);
         setting_value(s, v, 32);
-        l = 28 - wo_strlen(v);
+        l = 37 - wo_strlen(v);
         while (wo_strlen(b) < l) wo_strcat(b, " ", 64);
         wo_strcat(b, v, 64);
-        lv_add(s, 8, 0, 0, "", b, s >= S_RESETW && s <= S_WIPE ? C(TC_MAGENTA) : C(TC_TEXT), C(TC_INK));
+        lv_add(s, 6, 0, 0, "", b, s >= S_RESETW && s <= S_WIPE ? C(TC_MAGENTA) : C(TC_TEXT), C(TC_INK));
         if (TOP.sel == s && s == S_ABOUT) {
-            wo_strcpy(b, "", 64); wo_catu(b, WO_NENTRIES, 64); wo_strcat(b, " rules, ", 64); wo_catu(b, WO_NGLOSS, 64);
+            b[0] = 0; wo_catu(b, WO_NENTRIES, 64); wo_strcat(b, " rules, ", 64); wo_catu(b, WO_NGLOSS, 64);
             wo_strcat(b, " glossary terms, ", 64); wo_catu(b, WO_NMODES, 64); wo_strcat(b, " modes. From workorder.html.", 64);
-            lv_add(s, 24, 0, 0, "", b, C(TC_DIM), C(TC_INK));
+            lv_add(s, 18, 0, 0, "", b, C(TC_DIM), C(TC_INK));
         }
     }
-    chrome("SETTINGS", " ", "ALGO change  SCL toggle");
+    keys_common();
+    if (TOP.sel == S_RESETW || TOP.sel == S_WIPE) K(HB_BTN_FX, "", "reset");
+    else if (TOP.sel != S_ABOUT) K(HB_BTN_SEL, "change", 0);
+    chrome("SETTINGS", "ALGO changes");
     lv_draw(TOP.sel);
 }
 static void settings_change(int s, int d)
@@ -1333,8 +1480,13 @@ static void settings_change(int s, int d)
     case S_TARGET: { int t = W.set.target_min + d * 5; W.set.target_min = (uint8_t)(t < 0 ? 0 : t > 240 ? 240 : t); break; }
     case S_RMIN: { int t = W.set.minp + d; W.set.minp = (uint8_t)(t < 1 ? 1 : t > WO_NFIELDS ? WO_NFIELDS : t); if (W.set.maxp < W.set.minp) W.set.maxp = W.set.minp; break; }
     case S_RMAX: { int t = W.set.maxp + d; W.set.maxp = (uint8_t)(t < 1 ? 1 : t > WO_NFIELDS ? WO_NFIELDS : t); if (W.set.minp > W.set.maxp) W.set.minp = W.set.maxp; break; }
-    case S_RSEV: { static const uint8_t R[6] = {0, MSEV_ESCALATE, MSEV_GENTLE, MSEV_GENTLE + 1, MSEV_GENTLE + 2, 0}; int k = 0, j;
-                   for (j = 0; j < 5; j++) if (R[j] == W.set.rsev) k = j; k = (k + d + 5) % 5; W.set.rsev = R[k]; break; }
+    case S_RSEV: {
+        static const uint8_t R[5] = {0, MSEV_ESCALATE, MSEV_GENTLE, MSEV_GENTLE + 1, MSEV_GENTLE + 2};
+        int k = 0, j;
+        for (j = 0; j < 5; j++) if (R[j] == W.set.rsev) k = j;
+        k = (k + d + 5) % 5;
+        W.set.rsev = R[k];
+        break; }
     case S_CHAOS: W.set.chaos = !W.set.chaos; break;
     case S_HOLDS: W.set.holds = !W.set.holds; break;
     case S_RANCHOR: W.set.ranchor = !W.set.ranchor; break;
@@ -1348,19 +1500,22 @@ static void settings_change(int s, int d)
 static void settings_event(uint32_t kind, uint32_t id, int32_t arg)
 {
     if (kind == HB_EV_ENC && (id == HB_ENC_ALGORITHM || id == HB_ENC_KNOB1)) { settings_change(TOP.sel, arg > 0 ? 1 : -1); return; }
-    if (kind != HB_EV_BTN_DOWN || id != HB_BTN_SEL) return;
-    if (TOP.sel == S_RESETW) { if (confirm(700)) { wo_reset_weights(); wo_store_mark(ST_STATE); toast("Learning reset"); } }
-    else if (TOP.sel == S_WIPE) { if (confirm(701)) { wo_synth_stop(); wo_store_wipe(); go_root(PG_HOME); toast("Everything reset"); } }
-    else settings_change(TOP.sel, 1);
+    if (kind == EV_HOLD && id == HB_BTN_FX) {
+        if (TOP.sel == S_RESETW) { wo_reset_weights(); wo_store_mark(ST_STATE); toast("Learning reset"); }
+        else if (TOP.sel == S_WIPE) { wo_synth_stop(); wo_store_wipe(); go_root(PG_HOME); toast("Everything reset"); }
+        return;
+    }
+    if (kind == HB_EV_BTN_DOWN && id == HB_BTN_SEL && TOP.sel != S_RESETW && TOP.sel != S_WIPE) settings_change(TOP.sel, 1);
 }
 
 /* ================================================================ HELP */
 static const char *const HELP[] = {
-    "Everywhere", "HOME goes back. Hold it to leave WORKORDER. SELECT moves, SCL opens. GLO explains the terms in a line. PLAY loops the rolled chords. The keys play the rolled scale; OCT-/OCT+ shift them.",
-    "Roll", "ALGO severity, KNOB1 lines, KNOB2 mixed severity. EDIT switches a parameter on/off, SAVE holds it. REC rolls all, ARP rolls one, SEQ mutates, FX rolls at random. LFO issues the ticket.",
-    "Session", "SCL ticks a rule off, REC breaks it (say why), ARP unbreaks it, FX retires a rule from the pool for good. LFO pauses the clock, SAVE parks the ticket, EDIT closes and files it.",
-    "The Run", "Each round deals cards: SCL keeps one, ARP deals again. Tick it off to reach the next round. A broken brutal card costs two lives.",
-    "Typing", "White keys are A to P, black keys Q to Z, the top black key is a full stop. OCT- deletes, OCT+ is a space, EDIT capitals, KNOB1 and FX add a sign. SCL finishes.",
+    "The grid", "The bottom of the screen is laid out like the two rows of buttons. Each box names what that button does on this page. A dot in a box: holding the button does more (it shows while you hold).",
+    "Everywhere", "SELECT moves, PRESETS moves faster. SCL opens or ticks. HOME goes back (hold it to leave WORKORDER). GLO explains the terms in a line. ENV plays the rolled chords. The keys play the rolled scale; OCT- / OCT+ shift them.",
+    "Starting", "PLAY with no ticket rolls your setup and starts the clock. To tweak first, open Roll: REC rolls everything, ARP rerolls one parameter, SEQ mutates, LFO rolls at random, EDIT switches a parameter, SAVE holds it. Then PLAY.",
+    "Working", "SCL ticks a rule off. FX breaks it (say why) or unbreaks it. Hold FX to retire a rule from the pool for good. PLAY pauses the clock, SAVE parks the ticket, hold PLAY to finish, rate and file it.",
+    "Modes and the Run", "Modes: SCL starts one, and from then on PLAY starts that mode. In a Run each round deals cards: SCL keeps one, REC deals again. A broken brutal card costs two lives.",
+    "Typing", "White keys are A to P, black keys Q to Z, the top black key is a full stop. OCT- deletes, OCT+ is a space, EDIT gives a capital, KNOB1 picks a sign and FX puts it in. SCL finishes, HOME cancels.",
     "Scores", "Points drop the longer a ticket takes. Brutal counts 3.5x, firm 2x. Modes multiply. Keeper tickets teach the next rolls.",
 };
 static void draw_help(void)
@@ -1368,10 +1523,11 @@ static void draw_help(void)
     int i;
     lv_reset();
     for (i = 0; i < (int)(sizeof HELP / sizeof HELP[0]); i += 2) {
-        lv_add(i / 2, 4, 0, 0, "", HELP[i], C(TC_SIGNAL), C(TC_INK));
-        lv_add(i / 2, 12, 0, 0, "", HELP[i + 1], C(TC_TEXT), C(TC_INK));
+        lv_add(i / 2, 3, 0, 0, "", HELP[i], C(TC_SIGNAL), C(TC_INK));
+        lv_add(i / 2, 9, 0, 0, "", HELP[i + 1], C(TC_TEXT), C(TC_INK));
     }
-    chrome("HELP", " ", "SELECT scroll");
+    keys_common();
+    chrome("HELP", " ");
     lv_draw(TOP.sel);
 }
 
@@ -1402,8 +1558,8 @@ static void text_done(void)
         W.inv[W.ninv].roles = 1u << R_SYNTH; W.inv[W.ninv].on = 1;
         W.weight[WK_ITEM + W.ninv] = WQ_ONE;
         W.ninv++;
-        TOP.sel = (int16_t)(W.ninv - 1);
-        wo_store_mark(ST_STATE); toast("Added. ALGO sets its role");
+        TOP.sel = (int16_t)W.ninv;
+        wo_store_mark(ST_STATE); toast("Added. ALGO sets its category");
         break;
     case TX_INV_RENAME: if (n && tx.arg < W.ninv) { wo_strcpy(W.inv[tx.arg].name, s, WO_NAMELEN); wo_store_mark(ST_STATE); } break;
     case TX_MAT_NEW:
@@ -1421,62 +1577,69 @@ static void text_done(void)
 typedef void (*draw_fn)(void);
 typedef void (*event_fn)(uint32_t, uint32_t, int32_t);
 static void ev_none(uint32_t k, uint32_t i, int32_t a) { (void)k; (void)i; (void)a; }
-static void home_event(uint32_t kind, uint32_t id, int32_t arg) { (void)arg; if (kind == HB_EV_BTN_DOWN && id == HB_BTN_SEL) open_home(TOP.sel); }
-static void view_event(uint32_t kind, uint32_t id, int32_t arg)
-{
-    const wo_ticket_t *t = lib_ticket(TOP.arg);
-    (void)arg;
-    if (kind == HB_EV_BTN_DOWN && id == HB_BTN_GLO && t && TOP.sel < t->nitems) gloss_open(t->item[TOP.sel].text, item_skey(&t->item[TOP.sel]));
-}
 
-static const draw_fn DRAW[] = {draw_home, draw_roll, draw_field, draw_session, draw_rate, draw_modes, draw_parked,
-                               draw_library, draw_view, draw_scores, draw_rules, draw_gear, draw_buckets, draw_mats,
-                               draw_presets, draw_settings, draw_help, draw_gloss, draw_text_page, draw_help};
-static const event_fn EVENT[] = {home_event, roll_event, field_event, session_event, rate_event, modes_event,
-                                 parked_event, library_event, view_event, scores_event, rules_event, gear_event,
-                                 buckets_event, mats_event, presets_event, settings_event, ev_none, ev_none, ev_none, ev_none};
+static const draw_fn DRAW[PG_N] = {draw_home, draw_roll, draw_field, draw_session, draw_rate, draw_modes, draw_parked,
+                                   draw_library, draw_view, draw_scores, draw_rules, draw_gear, draw_buckets, draw_mats,
+                                   draw_presets, draw_settings, draw_help, draw_gloss, draw_text_page};
+static const event_fn EVENT[PG_N] = {home_event, roll_event, field_event, session_event, rate_event, modes_event,
+                                     parked_event, library_event, view_event, scores_event, rules_event, gear_event,
+                                     buckets_event, mats_event, presets_event, settings_event, ev_none, ev_none, ev_none};
 
-/* button LEDs: what does something on this page */
-static uint32_t page_buttons(uint8_t p)
-{
-#define B(x) (1u << HB_BTN_##x)
-    switch (p) {
-    case PG_ROLL: return B(REC) | B(ARP) | B(SEQ) | B(FX) | B(LFO) | B(SEL) | B(EDIT) | B(SAVE) | B(GLO);
-    case PG_FIELD: return B(REC) | B(ARP) | B(EDIT) | B(SAVE) | B(GLO) | B(LFO);
-    case PG_SESSION: return W.has_cur ? B(SEL) | B(REC) | B(ARP) | B(FX) | B(LFO) | B(SAVE) | B(EDIT) | B(GLO) : 0;
-    case PG_TEXT: return B(SEL) | B(EDIT) | B(FX) | B(OCT_DOWN) | B(OCT_UP);
-    case PG_RULES: return B(EDIT) | B(REC) | B(SEL) | B(FX) | B(GLO);
-    case PG_GEAR: return B(EDIT) | B(SEL) | B(REC) | B(FX) | B(SEQ);
-    default: return B(SEL);
-    }
-#undef B
-}
-
-static uint32_t leds_shown = 0xFFFFFFFFu; static uint32_t keys_shown = 0xFFFFFFFFu;
+/* LEDs: the buttons that do something on this page glow, the keys of the rolled scale glow */
+static uint32_t leds_shown = 0xFFFFFFFFu, keys_shown = 0xFFFFFFFFu;
 static void leds(void)
 {
-    uint32_t b = page_buttons(TOP.page), k = 0, i;
-    if (wo_synth_playing()) b |= 1u << HB_BTN_PLAY;
-    if (TOP.page == PG_TEXT) k = 0x7FFFFFFu;
+    uint32_t b = 0, k = 0, i;
+    for (i = 0; i < 12; i++) if ((key_tap[i] && key_tap[i][0]) || key_hold[i]) b |= 1u << (i + 2);
+    if (TOP.page == PG_TEXT) { b |= 3u; k = 0x7FFFFFFu; }
     else {
         sync_scale();
         for (i = 0; i < 27; i++) if (wo_synth_in_scale((int)i)) k |= 1u << i;
     }
     if (b != leds_shown) {
-        for (i = 0; i < 14; i++) H->led(i, (b >> i & 1u) ? ((i == HB_BTN_PLAY && wo_synth_playing()) ? 1u : 2u) : 0u);
+        for (i = 0; i < 14; i++) H->led(i, (b >> i & 1u) ? ((i == HB_BTN_ENV && wo_synth_playing()) ? 1u : 2u) : 0u);
         leds_shown = b;
     }
     if (k != keys_shown) { for (i = 0; i < 27; i++) H->led(HB_LED_KEY(i), (k >> i & 1u) ? 2u : 0u); keys_shown = k; }
+}
+
+/* the keys the module handles itself, before the page: ENV, PLAY, OCT-, OCT+ */
+static int global_tap(uint32_t id)
+{
+    if (id == HB_BTN_ENV) { chords_toggle(); return 1; }
+    if (id == HB_BTN_PLAY) {
+        if (!W.has_cur) quick_start();
+        else { wo_pause(); W.cur.powered_off = 0; wo_store_mark(ST_CUR); toast(W.cur.running ? "Clock running" : "Paused"); }
+        return 1;
+    }
+    if (id == HB_BTN_OCT_DOWN) { wo_synth_octave(-1); toast("Keys an octave down"); return 1; }
+    if (id == HB_BTN_OCT_UP) { wo_synth_octave(1); toast("Keys an octave up"); return 1; }
+    if (id == HB_BTN_HOME) { if (depth) pop(); return 1; }
+    return 0;
+}
+static int global_hold(uint32_t id)
+{
+    if (id == HB_BTN_PLAY && W.has_cur) { push(PG_RATE, 0); TOP.sel = 1; return 1; }
+    return 0;
 }
 
 /* ================================================================ the module's calls */
 void wo_ui_init(const hb_host_t *h)
 {
     H = h;
-    depth = 0; st[0].page = PG_HOME; st[0].sel = W.has_cur ? 1 : 0; st[0].scroll = 0;
+    depth = 0; st[0].page = PG_HOME; st[0].sel = 0; st[0].scroll = 0;
+    if (W.has_cur) push(PG_SESSION, 0);
     need_full = 1; leds_shown = keys_shown = 0xFFFFFFFFu;
+    held_btn = -1;
     wo_synth_volume(W.set.volume);
     sync_scale();
+}
+
+static void tap(uint32_t id)
+{
+    uint8_t p = TOP.page;
+    if (p != PG_TEXT && global_tap(id)) return;
+    EVENT[p](HB_EV_BTN_DOWN, id, 0);
 }
 
 void wo_ui_event(uint32_t ev, int32_t arg)
@@ -1484,13 +1647,11 @@ void wo_ui_event(uint32_t ev, int32_t arg)
     uint32_t kind = HB_EV_KIND(ev), id = HB_EV_ID(ev);
     uint8_t p = TOP.page;
     need_full = 1;
-    if (kind == HB_EV_BTN_DOWN && id == HB_BTN_HOME) { home_down = H->ms() | 1u; return; }
-    if (kind == HB_EV_BTN_UP && id == HB_BTN_HOME) {
-        if (home_down && H->ms() - home_down < 1200u) { if (p == PG_TEXT) pop(); else if (depth) pop(); }
-        home_down = 0;
+    if (p == PG_TEXT) {                         /* typing: every key is a letter, nothing is held */
+        if (kind == HB_EV_BTN_DOWN && id == HB_BTN_HOME) { pop(); return; }
+        text_event(kind, id, arg);
         return;
     }
-    if (p == PG_TEXT) { text_event(kind, id, arg); return; }
     if (kind == HB_EV_KEY_DOWN || kind == HB_EV_KEY_UP) {
         if (W.set.sound) { sync_scale(); wo_synth_key((int)id, kind == HB_EV_KEY_DOWN, arg); }
         need_full = 0;
@@ -1506,19 +1667,34 @@ void wo_ui_event(uint32_t ev, int32_t arg)
         return;
     }
     if (kind == HB_EV_BTN_DOWN) {
-        if (id == HB_BTN_PLAY) { if (W.set.sound) play_toggle(); else toast("Sound is off (Settings)"); return; }
-        if (id == HB_BTN_OCT_DOWN) { wo_synth_octave(-1); toast("Keys an octave down"); return; }
-        if (id == HB_BTN_OCT_UP) { wo_synth_octave(1); toast("Keys an octave up"); return; }
+        int gi = (int)id - 2;
+        if (id == HB_BTN_HOME) return;          /* on release: a long hold is the host's picker */
+        if (gi >= 0 && gi < 12 && key_hold[gi]) { held_btn = (int)id; held_fired = 0; held_t0 = H->ms(); return; }
+        tap(id);
+        return;
+    }
+    if (kind == HB_EV_BTN_UP) {
+        if (id == HB_BTN_HOME) { tap(id); return; }
+        if ((int)id == held_btn) {
+            held_btn = -1;
+            if (!held_fired) tap(id);
+        }
+        return;
     }
     EVENT[p](kind, id, arg);
-    if (TOP.page != p) need_full = 1;
 }
 
-/* the main loop's: redraw what changed, keep the clock, save when quiet */
+/* the main loop's: redraw what changed, fire holds, keep the clock, save when quiet */
 void wo_ui_draw(uint32_t full)
 {
     uint32_t t = H->ms();
     wo_synth_poll(t);
+    if (held_btn >= 0 && !held_fired && t - held_t0 >= HOLD_MS) {
+        uint8_t p = TOP.page;
+        held_fired = 1;
+        if (!global_hold((uint32_t)held_btn)) EVENT[p](EV_HOLD, (uint32_t)held_btn, 0);
+        need_full = 1;
+    }
     if (toast_until && t >= toast_until) { toast_until = 0; need_full = 1; }
     if (full) need_full = 1;
     if (need_full) {
@@ -1540,9 +1716,9 @@ void wo_ui_draw(uint32_t full)
         last_clock_s = wo_elapsed(&W.cur) / 1000u;
         nops = 0; tpos = 0;
         DRAW[TOP.page]();
-        for (i = 0; i < nops; i++) if (ops[i].y < 18) ops[keep++] = ops[i];
+        for (i = 0; i < nops; i++) if (ops[i].y < HDR_H) ops[keep++] = ops[i];
         nops = keep;
-        flush_rows(0, 18);
+        flush_rows(0, HDR_H);
         if (last_clock_s % 300u == 0u) wo_store_mark(ST_CUR);     /* the clock, every five minutes */
     }
     wo_store_poll(!wo_synth_busy());
