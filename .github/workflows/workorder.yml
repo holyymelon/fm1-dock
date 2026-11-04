@@ -1,0 +1,34 @@
+# Build WORKORDER as a standalone FM-1 firmware: any push, or Actions -> workorder -> Run workflow.
+# The package is the run's artifact (workorder-fwsc): download it from the run's page.
+name: workorder
+
+on:
+  push:
+    paths:
+      - "modules/workorder/**"
+      - ".github/workflows/workorder.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Python packages
+        run: pip install Pillow mido python-rtmidi
+      - name: JieLi toolchain
+        run: tools/get_toolchain.sh
+      - name: JieLi AC79 SDK (three files of it are needed for the package)
+        run: git clone --depth 1 --branch AC79NN_SDK_V1.2.1_2023-12-13 https://gitee.com/Jieli-Tech/fw-AC79_AIoT_SDK.git ~/fw-AC79_AIoT_SDK
+      - name: Build WORKORDER
+        run: ./build.sh --modules workorder --name workorder --app-name "WORKORDER" --identity FM-1_961
+      - uses: actions/upload-artifact@v4
+        with:
+          name: workorder-fwsc
+          path: |
+            build/workorder.fwsc
+            build/workorder.syms
+          if-no-files-found: error
