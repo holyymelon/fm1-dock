@@ -9,6 +9,9 @@ on:
       - ".github/workflows/workorder.yml"
   workflow_dispatch:
 
+permissions:
+  contents: write                 # the build also lands on the branch "builds" (for testing in fm1-emu)
+
 jobs:
   build:
     runs-on: ubuntu-24.04
@@ -32,3 +35,13 @@ jobs:
             build/workorder.fwsc
             build/workorder.syms
           if-no-files-found: error
+      - name: The package on the branch "builds" too
+        run: |
+          mkdir -p /tmp/out && cp build/workorder.fwsc build/workorder.syms build/workorder.bin /tmp/out/ 2>/dev/null || true
+          cd /tmp/out
+          git init -q -b builds
+          git config user.name "github-actions[bot]"
+          git config user.email "41898099+github-actions[bot]@users.noreply.github.com"
+          echo "Built from ${GITHUB_SHA} by run ${GITHUB_RUN_ID}" > BUILD.txt
+          git add -A && git commit -q -m "workorder ${GITHUB_SHA::7}"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${GITHUB_REPOSITORY}.git" builds
