@@ -17,8 +17,9 @@ extern wo_banks_t WB;
 void wo_store_load_all(void);
 void wo_store_mark(uint32_t what);
 int wo_store_flush(void);
-int wo_store_poll(int quiet);
+int wo_store_poll(int quiet, uint32_t force_ms);   /* write what changed when quiet, or after force_ms */
 uint32_t wo_store_failed(void);
+int wo_store_song_dropped(void);         /* a sketch did not fit its bank: the ticket went alone */
 void wo_store_wipe(void);
 int wo_park(void);
 int wo_unpark(int slot);

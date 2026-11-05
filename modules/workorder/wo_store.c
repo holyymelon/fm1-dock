@@ -6,6 +6,8 @@
  *   bank 4  the leaderboard             banks 5, 6  parked tickets
  *   banks 7, 8, 9  the library, as one ring of filed tickets, newest first
  * Text goes in byte-pair encoded (wo_bpe_encode), so a ticket of 30 rules fits in about 2 KB.
+ * A ticket's sketch goes after it, only the steps that sound: a few hundred bytes. The library keeps
+ * the sketches of the newest four filed tickets; the older ones keep their rules and lose the notes.
  * A bank that will not load (new FM-1, or a format change) leaves the defaults. */
 #include "wo.h"
 #include "wo_store.h"
@@ -153,6 +155,78 @@ static void get_chords(wo_chords_t *c)
     c->shape = (uint8_t)r8(); c->alt = (uint8_t)r8(); c->root = (uint8_t)r8(); c->scale = (uint8_t)r8();
 }
 
+/* ---------------------------------------------------------------- the sketch */
+#define SONG_MARK 0x53u              /* 'S' */
+static int pat_used(const sq_pat_t *p)
+{
+    int l, t, i;
+    for (l = 0; l < SQ_LANES; l++) if (p->hit[l]) return 1;
+    for (t = 0; t < 3; t++) for (i = 0; i < SQ_STEPS; i++) if (p->n[t][i].note) return 1;
+    return 0;
+}
+static void put_song(const wo_song_t *s)
+{
+    int p, l, t, i;
+    uint32_t used = 0;
+    w8(SONG_MARK); w8(1);
+    w8(s->div); w8(s->swing); w8(s->chain_on); w8(s->clock); w8(s->lanemute);
+    w8(s->nchain); wraw(s->chain, s->nchain);
+    for (t = 0; t < TR_N; t++) wraw(&s->tr[t], sizeof s->tr[t]);
+    for (l = 0; l < SQ_LANES; l++) wraw(&s->dr[l], sizeof s->dr[l]);
+    for (p = 0; p < SQ_PATS; p++) w8(s->pat[p].len);
+    for (p = 0; p < SQ_PATS; p++) if (pat_used(&s->pat[p])) used |= 1u << p;
+    w8(used);
+    for (p = 0; p < SQ_PATS; p++) {
+        const sq_pat_t *pt = &s->pat[p];
+        uint32_t lm = 0;
+        if (!(used >> p & 1u)) continue;
+        for (l = 0; l < SQ_LANES; l++) if (pt->hit[l]) lm |= 1u << l;
+        w8(lm);
+        for (l = 0; l < SQ_LANES; l++) if (lm >> l & 1u) { w16(pt->hit[l]); w16(pt->acc[l]); }
+        for (t = 0; t < 3; t++) {
+            uint32_t m = 0;
+            for (i = 0; i < SQ_STEPS; i++) if (pt->n[t][i].note) m |= 1u << i;
+            w16(m);
+            for (i = 0; i < SQ_STEPS; i++) if (m >> i & 1u) { w8(pt->n[t][i].note); w8(pt->n[t][i].len); w8(pt->n[t][i].vel); }
+        }
+    }
+}
+static int get_song(wo_song_t *s)
+{
+    int p, l, t, i;
+    uint32_t used;
+    if (r8() != 1) return -1;
+    s->div = (uint8_t)r8(); s->swing = (uint8_t)r8(); s->chain_on = (uint8_t)r8(); s->clock = (uint8_t)r8(); s->lanemute = (uint8_t)r8();
+    s->nchain = (uint8_t)r8();
+    if (s->nchain > SQ_CHAIN || (s->div != 2 && s->div != 4)) return -1;
+    rraw(s->chain, s->nchain);
+    for (i = 0; i < s->nchain; i++) s->chain[i] %= SQ_PATS;
+    for (t = 0; t < TR_N; t++) {
+        rraw(&s->tr[t], sizeof s->tr[t]);
+        if (s->tr[t].eng >= ENG_N) s->tr[t].eng = 0;
+        s->tr[t].ch &= 15u;
+    }
+    for (l = 0; l < SQ_LANES; l++) rraw(&s->dr[l], sizeof s->dr[l]);
+    for (p = 0; p < SQ_PATS; p++) { s->pat[p].len = (uint8_t)r8(); if (s->pat[p].len < 1 || s->pat[p].len > SQ_STEPS) s->pat[p].len = 16; }
+    used = r8();
+    for (p = 0; p < SQ_PATS && !bover; p++) {
+        sq_pat_t *pt = &s->pat[p];
+        uint32_t lm;
+        if (!(used >> p & 1u)) continue;
+        lm = r8();
+        for (l = 0; l < SQ_LANES; l++) if (lm >> l & 1u) { pt->hit[l] = (uint16_t)r16(); pt->acc[l] = (uint16_t)r16(); }
+        for (t = 0; t < 3; t++) {
+            uint32_t m = r16();
+            for (i = 0; i < SQ_STEPS; i++) if (m >> i & 1u) {
+                pt->n[t][i].note = (uint8_t)r8(); pt->n[t][i].len = (uint8_t)r8(); pt->n[t][i].vel = (uint8_t)r8();
+                if (pt->n[t][i].note > 127) pt->n[t][i].note = 0;
+            }
+        }
+    }
+    s->made = 1;
+    return bover ? -1 : 0;
+}
+
 static void put_ticket(const wo_ticket_t *c, uint32_t now_elapsed)
 {
     int i;
@@ -231,14 +305,32 @@ static int get_ticket(wo_ticket_t *c)
     }
     c->rating = (uint8_t)r8(); rstr(c->note, WO_WHY); c->score = r32();
     if (c->mode >= WO_NMODES) c->mode = M_FREE;
-    return bover ? -1 : 0;
+    if (bover) return -1;
+    if (bp < blen && buf[bp] == SONG_MARK) {             /* the sketch, when it has one */
+        bp++;
+        if (get_song(&c->song)) { uint8_t *q2 = (uint8_t *)&c->song; for (q = 0; q < sizeof c->song; q++) q2[q] = 0; bover = 0; }
+    }
+    return 0;
 }
 
+static int song_dropped;
+/* a ticket and its sketch; if the two don't fit a bank, the ticket alone */
+static void put_with_song(const wo_ticket_t *c, uint32_t el)
+{
+    uint32_t start = bp;
+    put_ticket(c, el);
+    if (c->song.made && c->song.div) {
+        uint32_t mid = bp;
+        put_song(&c->song);
+        if (bover) { bp = mid; bover = 0; song_dropped = 1; }
+    }
+    (void)start;
+}
 static void put_cur(void)
 {
     begin(2);
     w8(W.has_cur);
-    if (W.has_cur) put_ticket(&W.cur, wo_elapsed(&W.cur));
+    if (W.has_cur) put_with_song(&W.cur, wo_elapsed(&W.cur));
 }
 static void get_cur(void)
 {
@@ -371,7 +463,7 @@ int wo_park(void)
     if (c->running) { c->elapsed = wo_elapsed(c); c->running = 0; }
     if (c->paused_at) { c->paused_ms += wo_now() - c->paused_at; c->paused_at = 0; }
     c->parks++;
-    begin(5); w8(1); w32(c->elapsed); wstr(c->name); put_ticket(c, c->elapsed);
+    begin(5); w8(1); w32(c->elapsed); wstr(c->name); put_with_song(c, c->elapsed);
     if (save_bank(5u + (uint32_t)slot)) return -2;
     park_used[slot] = 1;
     wo_strcpy(park_name[slot], c->name, 56);
@@ -452,13 +544,41 @@ static int put_lib(void)
     return bad ? -1 : 0;
 }
 
+/* records of kind 10 carry the ticket's length first, so its sketch can be cut off later */
+#define LIB_SONGS 4
+static void lib_strip(int from)
+{
+    uint32_t p = 0, l;
+    int k = 0;
+    while (p + 2 <= liblen) {
+        l = lib[p] | ((uint32_t)lib[p + 1] << 8);
+        if (p + 2 + l > liblen) break;
+        if (k >= from && l >= 5 && lib[p + 4] == 10) {
+            uint32_t tl = lib[p + 5] | ((uint32_t)lib[p + 6] << 8), nl = 5 + tl, i, cut;
+            if (nl < l) {
+                cut = l - nl;
+                for (i = p + 2 + nl; i + cut < liblen; i++) lib[i] = lib[i + cut];
+                liblen -= cut;
+                l = nl;
+                lib[p] = (uint8_t)(l & 0xFFu); lib[p + 1] = (uint8_t)(l >> 8);
+            }
+        }
+        p += 2 + l; k++;
+    }
+}
+
 /* file a closed ticket: newest first, the oldest fall off the end */
 static void lib_add(const wo_ticket_t *c)
 {
-    uint32_t n, p, keep;
-    begin(9); put_ticket(c, c->elapsed);
+    uint32_t n, p, keep, tl;
+    begin(10); w16(0);
+    put_ticket(c, c->elapsed);
     if (bover) return;
+    tl = bp - 5u;
+    if (c->song.made && c->song.div) { put_song(&c->song); if (bover) { bp = tl + 5u; bover = 0; } }
+    buf[3] = (uint8_t)(tl & 0xFFu); buf[4] = (uint8_t)(tl >> 8);
     n = bp;
+    lib_strip(LIB_SONGS - 1);                         /* the new one goes first: the fourth newest keeps its notes */
     keep = 0; p = 0;
     while (p + 2 <= liblen) {
         uint32_t l = lib[p] | ((uint32_t)lib[p + 1] << 8);
@@ -489,7 +609,8 @@ int wo_lib_get(int idx, wo_ticket_t *out)
         if (k == idx) {
             uint32_t i;
             for (i = 0; i < l && i < BANK_MAX; i++) buf[i] = lib[p + 2 + i];
-            bp = 3; blen = l; bover = 0;              /* past begin()'s three bytes */
+            bp = buf[2] == 10 ? 5u : 3u;               /* past begin()'s three bytes (and the ticket's length) */
+            blen = l; bover = 0;
             return get_ticket(out);
         }
         p += 2 + l; k++;
@@ -518,6 +639,7 @@ static uint32_t dirty, dirty_at, failed;
 
 void wo_store_mark(uint32_t what) { dirty |= what; dirty_at = wo_now(); }
 uint32_t wo_store_failed(void) { uint32_t f = failed; failed = 0; return f; }
+int wo_store_song_dropped(void) { int d = song_dropped; song_dropped = 0; return d; }
 
 int wo_store_flush(void)
 {
@@ -534,11 +656,11 @@ int wo_store_flush(void)
 }
 
 /* from the main loop: write what changed once things have been still for a moment */
-int wo_store_poll(int quiet)
+int wo_store_poll(int quiet, uint32_t force_ms)
 {
     uint32_t t = wo_now();
     if (!dirty) return 0;
-    if ((quiet && t - dirty_at > 1500u) || t - dirty_at > 20000u) { wo_store_flush(); return 1; }
+    if ((quiet && t - dirty_at > 1500u) || t - dirty_at > force_ms) { wo_store_flush(); return 1; }
     return 0;
 }
 

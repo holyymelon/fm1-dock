@@ -121,6 +121,40 @@ typedef struct {
 
 enum { RATE_KEEPER, RATE_NEUTRAL, RATE_DEAD, RATE_ABANDONED };
 
+/* ---- the sketch: four tracks of one-bar patterns, played in the ticket's key, tempo, meter and chords
+ * (wo_seq.c builds and edits it, wo_synth.c plays it). Saved with the ticket. */
+#define SQ_PATS  8
+#define SQ_STEPS 16
+#define SQ_CHAIN 16
+#define SQ_LANES 8
+enum { TR_DRUMS, TR_BASS, TR_CHORDS, TR_LEAD, TR_N };
+enum { ENG_FM, ENG_SAW, ENG_SQUARE, ENG_N };            /* drums: ENG_FM is the FM kit, ENG_SAW the analog kit */
+typedef struct { uint8_t note, len, vel; } sq_note_t;  /* note 0: none. Chords: 1 + which of the ticket's chords */
+typedef struct {
+    uint16_t hit[SQ_LANES], acc[SQ_LANES];             /* drums: bit s, step s */
+    sq_note_t n[3][SQ_STEPS];                           /* bass, chords, lead */
+    uint8_t len;                                        /* steps in this bar */
+} sq_pat_t;
+typedef struct { uint8_t eng, p[4], vol, ch, mute; } sq_track_t;
+typedef struct { uint8_t tune, decay, level; } sq_drum_t;
+typedef struct {
+    uint8_t div;                /* steps per beat: 4 (sixteenths) or 2 (eighths); 0: not set up yet */
+    uint8_t made;               /* something of yours is in it (else it is rebuilt from the ticket) */
+    uint8_t swing, chain_on, nchain, chain[SQ_CHAIN];
+    uint8_t clock, lanemute;    /* clock: MIDI clock out */
+    sq_track_t tr[TR_N];
+    sq_drum_t dr[SQ_LANES];
+    sq_pat_t pat[SQ_PATS];
+} wo_song_t;
+
+/* what a ticket locks: the scale for the keys, the tempo, the bars' lengths, the chords */
+typedef struct {
+    int root; uint16_t mask; int bpm;
+    uint8_t nbars, bar[4], div;  /* the meter as bars of steps, in turn */
+    uint8_t every4;             /* "with every fourth bar in": bars A A A B */
+    wo_chords_t ch;
+} wo_basics_t;
+
 typedef struct {
     uint32_t id;                /* the ticket's number on this FM-1 */
     char name[56];
@@ -139,6 +173,7 @@ typedef struct {
     uint8_t is_run; wo_run_t run;
     uint8_t rating, powered_off; char note[WO_WHY];
     uint32_t score;
+    wo_song_t song;
 } wo_ticket_t;
 
 /* the leaderboard: one line per closed ticket */

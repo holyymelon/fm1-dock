@@ -9,11 +9,12 @@
  *   PLAY start the ticket (no ticket: roll and start in one press), pause / resume
  *   REC  make new: roll, deal again, add      ARP  reroll the selected one    SEQ  mutate
  *   LFO  random                               EDIT on / off, edit             SAVE hold, park
- *   FX   break / unbreak                      ENV  hear the chords */
+ *   FX   break / unbreak                      ENV  play / stop the sketch */
 #include "hb_module.h"
 #include "wo.h"
 #include "wo_store.h"
 #include "wo_synth.h"
+#include "wo_seq.h"
 #include "wo_ui.h"
 #include "wo_font.h"
 
@@ -100,7 +101,7 @@ static void flush_rows(int y0, int y1)
 
 /* ================================================================ pages */
 enum { PG_HOME, PG_ROLL, PG_FIELD, PG_SESSION, PG_RATE, PG_MODES, PG_PARKED, PG_LIBRARY, PG_VIEW, PG_SCORES,
-       PG_RULES, PG_GEAR, PG_BUCKETS, PG_MATS, PG_PRESETS, PG_SETTINGS, PG_HELP, PG_GLOSS, PG_TEXT, PG_N };
+       PG_RULES, PG_GEAR, PG_BUCKETS, PG_MATS, PG_PRESETS, PG_SETTINGS, PG_HELP, PG_GLOSS, PG_TEXT, PG_SEQ, PG_SOUND, PG_N };
 typedef struct { uint8_t page; int16_t sel; int16_t scroll; int16_t arg; } frame_t;
 static frame_t st[10];
 static int depth;
@@ -213,7 +214,8 @@ static uint8_t foot_btn[3]; static const char *foot_lab[3]; static int nfoot;
 static void F(int btn, const char *lab) { if (nfoot < 3) { foot_btn[nfoot] = (uint8_t)btn; foot_lab[nfoot++] = lab; } }
 
 /* the menu: the page's actions in groups. An item runs a button (as if pressed) or its own action */
-enum { A_NONE, A_FINISH, A_PARK, A_FORGOOD, A_RESETW, A_WIPE, A_HOMEPAGE, A_HELP, A_GLOSS };
+enum { A_NONE, A_FINISH, A_PARK, A_FORGOOD, A_RESETW, A_WIPE, A_HOMEPAGE, A_HELP, A_GLOSS, A_SKETCH,
+       A_SQ_CLEARROW, A_SQ_CLEARPAT, A_SQ_COPY, A_SQ_CHADD, A_SQ_CHDROP, A_SQ_CHMODE, A_SQ_CHCLEAR, A_SQ_CLOCK };
 typedef struct { const char *group, *label; uint8_t btn, act, confirm; } mi_t;
 #define MAXMI 26
 static mi_t mi[MAXMI]; static int nmi;
@@ -510,17 +512,7 @@ static void sync_scale(void)
     wo_synth_scale(0, 0x0FFF);
 }
 
-static int have_chords(void) { int bpm; const wo_chords_t *c = chords_now(&bpm); return c && c->n; }
-
-static void chords_toggle(void)
-{
-    int bpm;
-    const wo_chords_t *c = chords_now(&bpm);
-    if (!W.set.sound) { toast("Sound is off (Settings)"); return; }
-    if (wo_synth_playing()) { wo_synth_stop(); toast("Chords stopped"); return; }
-    if (!c || !c->n) { toast("No chords rolled: switch Chords on"); return; }
-    wo_synth_play(c, bpm, H->ms());
-}
+static void sketch_toggle(void);
 
 static void mode_name(uint8_t m, char *o, int cap) { wo_str(WO_MODES[m < WO_NMODES ? m : 0].name, o, cap); }
 
@@ -529,7 +521,7 @@ static void keys_common(void)
 {
     keys_clear();
     if (depth) K(HB_BTN_HOME, "back", 0);
-    if (have_chords()) K(HB_BTN_ENV, "chords", 0);
+    K(HB_BTN_ENV, "sketch", 0);
     K(HB_BTN_PLAY, "play", 0);
     K(HB_BTN_GLO, "menu", 0);
 }
@@ -540,8 +532,9 @@ static void menu_common(void)
         MI("Ticket", W.cur.running ? "Pause the clock" : "Resume the clock", HB_BTN_PLAY, 0, 0);
         MI("Ticket", "Finish and rate it", 0, A_FINISH, 0);
         MI("Ticket", "Park it for later", 0, A_PARK, 0);
+        if (TOP.page != PG_SEQ && TOP.page != PG_SOUND) MI("Ticket", "Open its sketch", 0, A_SKETCH, 0);
     } else MI("Ticket", "Roll and start a ticket", HB_BTN_PLAY, 0, 0);
-    if (have_chords()) MI("Sound", wo_synth_playing() ? "Stop the chords" : "Hear the chords", HB_BTN_ENV, 0, 0);
+    MI("Sound", wo_seq_playing() ? "Stop the sketch" : "Play the sketch", HB_BTN_ENV, 0, 0);
     if (depth) MI("Go", "Home", 0, A_HOMEPAGE, 0);
     MI("Go", "Help", 0, A_HELP, 0);
 }
@@ -549,7 +542,7 @@ static void menu_common(void)
 /* PLAY with no ticket: roll what is set up and start the clock, in one press */
 static void quick_start(void)
 {
-    wo_synth_stop();
+    wo_seq_stop();
     if (W.set.mode != M_FREE && W.set.mode < WO_NMODES) {
         char b[40];
         wo_start_mode(W.set.mode);
@@ -571,11 +564,11 @@ static void quick_start(void)
 
 /* ================================================================ HOME */
 /* grouped: what you play, what you kept, how it is set up */
-static const char *const HOME_ITEMS[] = {"Session", "Roll", "Modes", "Parked", "Library", "Scores", "Rules", "Gear",
-                                         "Materials", "Presets", "Settings", "Help"};
-static const uint8_t HOME_PAGE[] = {PG_SESSION, PG_ROLL, PG_MODES, PG_PARKED, PG_LIBRARY, PG_SCORES, PG_RULES, PG_GEAR,
-                                    PG_MATS, PG_PRESETS, PG_SETTINGS, PG_HELP};
-#define NHOME 12
+static const char *const HOME_ITEMS[] = {"Session", "Sketch", "Roll", "Modes", "Parked", "Library", "Scores", "Rules",
+                                         "Gear", "Materials", "Presets", "Settings", "Help"};
+static const uint8_t HOME_PAGE[] = {PG_SESSION, PG_SEQ, PG_ROLL, PG_MODES, PG_PARKED, PG_LIBRARY, PG_SCORES, PG_RULES,
+                                    PG_GEAR, PG_MATS, PG_PRESETS, PG_SETTINGS, PG_HELP};
+#define NHOME 13
 static void draw_home(void)
 {
     char sub[48];
@@ -585,8 +578,8 @@ static void draw_home(void)
         int on = 0, k;
         char row[COLS + 1];
         if (i == 0) lv_add(-1, 3, 0, 0, "", "PLAY", C(TC_CYAN), C(TC_INK));
-        if (i == 4) { lv_note(" ", C(TC_INK)); lv_add(-1, 3, 0, 0, "", "LIBRARY", C(TC_CYAN), C(TC_INK)); }
-        if (i == 6) { lv_note(" ", C(TC_INK)); lv_add(-1, 3, 0, 0, "", "SETUP", C(TC_CYAN), C(TC_INK)); }
+        if (i == 5) { lv_note(" ", C(TC_INK)); lv_add(-1, 3, 0, 0, "", "LIBRARY", C(TC_CYAN), C(TC_INK)); }
+        if (i == 7) { lv_note(" ", C(TC_INK)); lv_add(-1, 3, 0, 0, "", "SETUP", C(TC_CYAN), C(TC_INK)); }
         sub[0] = 0;
         switch (i) {
         case 0:
@@ -598,18 +591,25 @@ static void draw_home(void)
                 wo_strcat(sub, W.cur.running ? " running" : " paused", 48);
             } else wo_strcpy(sub, "none: PLAY starts one", 48);
             break;
-        case 1: for (k = 0; k < WO_NFIELDS; k++) on += W.on[k];
+        case 1:
+            if (W.has_cur && W.cur.song.div) {
+                for (k = 0; k < SQ_PATS; k++) on += !wo_seq_pat_empty(&W.cur.song, k);
+                wo_catu(sub, (uint32_t)on, 48); wo_strcat(sub, on == 1 ? " pattern" : " patterns", 48);
+            } else wo_strcpy(sub, W.has_cur ? "drums, bass, chords, lead" : "with a ticket", 48);
+            if (wo_seq_playing()) wo_strcat(sub, ", playing", 48);
+            break;
+        case 2: for (k = 0; k < WO_NFIELDS; k++) on += W.on[k];
                 wo_catu(sub, (uint32_t)on, 48); wo_strcat(sub, " params", 48);
                 if (wo_draft_ready()) wo_strcat(sub, ", rolled", 48);
                 break;
-        case 2: mode_name(W.set.mode, sub, 30); break;
-        case 3: wo_catu(sub, (uint32_t)wo_parked_count(), 48); wo_strcat(sub, " of 2", 48); break;
-        case 4: wo_catu(sub, (uint32_t)wo_lib_count(), 48); wo_strcat(sub, " filed", 48); break;
-        case 5: wo_catu(sub, W.nscores, 48); wo_strcat(sub, " scored", 48); break;
-        case 6: wo_catu(sub, WO_NENTRIES + W.ncustom, 48); wo_strcat(sub, " rules", 48); break;
-        case 7: for (k = 0; k < W.ninv; k++) on += wo_inv_on((uint8_t)k); wo_catu(sub, (uint32_t)on, 48); wo_strcat(sub, " on", 48); break;
-        case 8: wo_catu(sub, WO_NMAT + W.nmatadd, 48); wo_strcat(sub, " sounds", 48); break;
-        case 9: wo_catu(sub, WO_NBUILTIN, 48); wo_strcat(sub, " setups", 48); break;
+        case 3: mode_name(W.set.mode, sub, 30); break;
+        case 4: wo_catu(sub, (uint32_t)wo_parked_count(), 48); wo_strcat(sub, " of 2", 48); break;
+        case 5: wo_catu(sub, (uint32_t)wo_lib_count(), 48); wo_strcat(sub, " filed", 48); break;
+        case 6: wo_catu(sub, W.nscores, 48); wo_strcat(sub, " scored", 48); break;
+        case 7: wo_catu(sub, WO_NENTRIES + W.ncustom, 48); wo_strcat(sub, " rules", 48); break;
+        case 8: for (k = 0; k < W.ninv; k++) on += wo_inv_on((uint8_t)k); wo_catu(sub, (uint32_t)on, 48); wo_strcat(sub, " on", 48); break;
+        case 9: wo_catu(sub, WO_NMAT + W.nmatadd, 48); wo_strcat(sub, " sounds", 48); break;
+        case 10: wo_catu(sub, WO_NBUILTIN, 48); wo_strcat(sub, " setups", 48); break;
         default: break;
         }
         {
@@ -711,7 +711,7 @@ static void roll_event(uint32_t kind, uint32_t id, int32_t arg)
     switch (id) {
     case HB_BTN_EDIT: W.on[f] = !W.on[f]; wo_store_mark(ST_STATE); break;
     case HB_BTN_SAVE: W.lock[f] = !W.lock[f]; toast(W.lock[f] ? "Held: rolls leave it alone" : "Released"); wo_store_mark(ST_STATE); break;
-    case HB_BTN_REC: wo_synth_stop(); wo_roll_all(); wo_store_mark(ST_DRAFT | ST_STATE); toast("Rolled"); break;
+    case HB_BTN_REC: wo_seq_stop(); wo_roll_all(); wo_store_mark(ST_DRAFT | ST_STATE); toast("Rolled"); break;
     case HB_BTN_ARP: if (W.on[f]) { wo_roll_field(f); wo_store_mark(ST_DRAFT | ST_STATE); } else toast("It is off: EDIT switches it on"); break;
     case HB_BTN_SEQ: wo_mutate(); wo_store_mark(ST_DRAFT | ST_STATE); toast("Mutated"); break;
     case HB_BTN_LFO: wo_full_random(); wo_store_mark(ST_DRAFT | ST_STATE); toast(W.set.chaos ? "Chaos roll" : "Random roll"); break;
@@ -944,7 +944,9 @@ static void session_event(uint32_t kind, uint32_t id, int32_t arg)
         if (hand) { wo_redeal(); wo_store_mark(ST_CUR); toast(c->run.nhand ? "Dealt again" : "Nothing left to deal"); }
         break;
     case HB_BTN_SAVE: {
-        int r = wo_park();
+        int r;
+        wo_seq_stop();
+        r = wo_park();
         toast(r == 0 ? "Ticket parked" : r == -1 ? "Both park slots are taken" : "Could not save it");
         if (!r) go_root(PG_HOME);
         break; }
@@ -987,7 +989,7 @@ static void rate_event(uint32_t kind, uint32_t id, int32_t arg)
     if (kind != HB_EV_BTN_DOWN) return;
     if (id == HB_BTN_EDIT) { text_begin(TX_NOTE, 0, 0, "ONE LINE OF OUTCOME", rate_note, WO_WHY); return; }
     if (id == HB_BTN_SEL && TOP.sel >= 0 && TOP.sel < 4) {
-        wo_synth_stop();
+        wo_seq_stop();
         wo_close((uint8_t)TOP.sel, rate_note);
         rate_note[0] = 0;
         wo_store_mark(ST_ALL);
@@ -1050,7 +1052,7 @@ static void modes_event(uint32_t kind, uint32_t id, int32_t arg)
     m = mode_order[TOP.sel % WO_NMODES];
     if (id == HB_BTN_SEL) {
         if (W.has_cur && wo_park()) { toast("Park slots full: finish a ticket first"); return; }
-        wo_synth_stop();
+        wo_seq_stop();
         if (m == M_FREE) { W.set.mode = M_FREE; wo_store_mark(ST_STATE); go_root(PG_ROLL); toast("Free play: your own setup"); return; }
         wo_start_mode((uint8_t)m);
         wo_store_mark(ST_ALL);
@@ -1091,7 +1093,9 @@ static void parked_event(uint32_t kind, uint32_t id, int32_t arg)
     s = wo_parked_slot(TOP.sel);
     if (kind == EV_HOLD && id == HB_BTN_FX) { wo_discard_parked(s); toast("Discarded"); return; }
     if (kind == HB_EV_BTN_DOWN && id == HB_BTN_SEL) {
-        int r = wo_unpark(s);
+        int r;
+        wo_seq_stop();
+        r = wo_unpark(s);
         if (r) { toast(r == -2 ? "No slot free for the ticket in play" : "Could not read it"); return; }
         go_root(PG_SESSION); toast("Resumed");
     }
@@ -1150,6 +1154,7 @@ static void library_event(uint32_t kind, uint32_t id, int32_t arg)
         const wo_ticket_t *t = lib_ticket(TOP.sel);
         int i;
         if (!t || t->is_run) { toast("A run can't be started again"); return; }
+        wo_seq_stop();
         if (W.has_cur && wo_park()) { toast("Park slots full"); return; }
         W.cur = *t;
         W.cur.id = W.next_id++;
@@ -1178,6 +1183,12 @@ static void draw_view(void)
     wo_strcpy(b, RATES[t->rating & 3], 80); wo_strcat(b, "  ", 80); wo_catu(b, t->score, 80); wo_strcat(b, " pts", 80);
     lv_note(b, C(TC_TEXT));
     if (t->note[0]) lv_add(-1, 3, 0, 0, "\"", t->note, C(TC_DIM), C(TC_INK));
+    if (t->song.div) {
+        int p, np = 0;
+        for (p = 0; p < SQ_PATS; p++) np += !wo_seq_pat_empty(&t->song, p);
+        wo_strcpy(b, "Sketch: ", 80); wo_catu(b, (uint32_t)np, 80); wo_strcat(b, np == 1 ? " pattern. ENV plays it." : " patterns. ENV plays it.", 80);
+        lv_note(b, C(TC_CYAN));
+    } else lv_note("No notes kept with it (the newest 4 keep theirs). ENV plays its chords.", C(TC_DIMMER));
     for (i = 0; i < t->nitems; i++) {
         const wo_item_t *it = &t->item[i];
         lv_add(i, 4, it->tier < 3 ? TIERCH[it->tier] : 0, tier_col(it->tier),
@@ -1196,6 +1207,498 @@ static void view_event(uint32_t kind, uint32_t id, int32_t arg)
     (void)arg;
     if (kind == HB_EV_BTN_DOWN && id == HB_BTN_GLO && t && TOP.sel >= 0 && TOP.sel < t->nitems)
         gloss_open(t->item[TOP.sel].text, item_skey(&t->item[TOP.sel]));
+}
+
+/* ================================================================ SKETCH: the ticket's patterns */
+/* eight drum lanes, bass, chords, lead; one bar a pattern, in the ticket's meter. The keys are the
+ * steps of the highlighted row; with REC on they play it and write what you play */
+static const char *const ROWNAME[WO_SEQ_ROWS] = {"KICK", "SNARE", "C.HAT", "O.HAT", "CLAP", "LO TOM", "HI TOM", "PERC",
+                                                 "BASS", "CHORDS", "LEAD"};
+static const char *const TRNAME[TR_N] = {"DRUMS", "BASS", "CHORDS", "LEAD"};
+static const char *const ENGNAME[2][ENG_N] = {{"FM", "saw + filter", "square + filter"}, {"FM kit", "analog kit", "analog kit"}};
+static const char *const PNAME[2][4] = {{"Ratio", "Depth", "Mod decay", "Decay"}, {"Cutoff", "Resonance", "Filter env", "Decay"}};
+static const char *const PSHORT[2][4] = {{"ratio", "depth", "mod", "dec"}, {"cut", "res", "env", "dec"}};
+static const char *const RATIOS[10] = {"0.5", "1", "1.5", "2", "3", "4", "5", "6", "7", "8"};
+static const char PATCH[] = "ABCDEFGH";
+#define SK_GX 42                /* the first step's x */
+#define SK_CW 12                /* a step's width */
+#define SK_YPAT (Y0 + ROWH)
+#define SK_YRUL (Y0 + 2 * ROWH)
+#define SK_YGRID (Y0 + 3 * ROWH)
+#define SK_YINFO (SK_YGRID + WO_SEQ_ROWS * ROWH + 2)
+
+static struct {
+    int pat, cur, rec, shown;   /* the pattern edited, the step cursor, REC, the play position drawn */
+    int8_t kpat[27], krow[27], kstep[27];   /* live: where each held key wrote */
+    uint8_t knotes[27][6], kn[27];          /* what each held key sounds */
+} sk;
+static wo_basics_t skb;
+
+static wo_song_t *sk_song(void)
+{
+    if (!W.has_cur) return 0;
+    wo_basics_ticket(&W.cur, &skb);
+    wo_song_ready(&W.cur.song, &skb);
+    wo_synth_song(&W.cur.song);
+    if (sk.pat < 0 || sk.pat >= SQ_PATS) sk.pat = 0;
+    if (sk.cur >= wo_seq_pat_len(&W.cur.song, sk.pat)) sk.cur = 0;
+    return &W.cur.song;
+}
+static void sk_changed(void) { W.cur.song.made = 1; wo_store_mark(ST_CUR); }
+static int sk_row(void) { return TOP.sel < 0 ? 0 : TOP.sel >= WO_SEQ_ROWS ? WO_SEQ_ROWS - 1 : TOP.sel; }
+
+/* the short form of the basics: "C minor  112 bpm  7/8 into 4/4" */
+static void sk_basics_line(char *o, int cap)
+{
+    static const char *const NN[12] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
+    char b[48];
+    o[0] = 0;
+    if (W.cur.has_key) {
+        if (W.cur.key.root >= 0) { wo_strcat(o, NN[W.cur.key.root % 12], cap); wo_strcat(o, " ", cap); }
+        wo_str(WO_SCALES[W.cur.key.scale].name, b, 48); wo_strcat(o, b, cap);
+    } else if (W.cur.has_chords) { wo_strcat(o, NN[W.cur.chords.root % 12], cap); wo_strcat(o, " (chords' key)", cap); }
+    else wo_strcat(o, "any key", cap);
+    wo_strcat(o, "  ", cap); wo_catu(o, (uint32_t)skb.bpm, cap); wo_strcat(o, " bpm", cap);
+    if (W.cur.has_tempo) { wo_strcat(o, "  ", cap); wo_str(WO_METER[W.cur.tempo.tier][W.cur.tempo.meter], b, 48); wo_strcat(o, b, cap); }
+}
+
+static void clip_text(int x, int y, const char *s, uint16_t c, int cols)
+{
+    char b[COLS + 1];
+    wo_strcpy(b, s, cols + 1 > COLS + 1 ? COLS + 1 : cols + 1);
+    if (wo_strlen(s) > cols && cols > 1) b[cols - 1] = '.';
+    d_text(x, y, b, c);
+}
+
+static void sk_track_line(const wo_song_t *s, int row, char *o, int cap)
+{
+    int tr = wo_seq_row_track(row), i;
+    const sq_track_t *t = &s->tr[tr];
+    o[0] = 0;
+    if (tr == TR_DRUMS) {
+        const sq_drum_t *d = &s->dr[row];
+        wo_strcat(o, ENGNAME[1][t->eng], cap);
+        wo_strcat(o, "  ", cap); wo_strcat(o, ROWNAME[row], cap);
+        wo_strcat(o, "  tune ", cap); wo_catu(o, d->tune, cap);
+        wo_strcat(o, " dec ", cap); wo_catu(o, d->decay, cap);
+        wo_strcat(o, " lvl ", cap); wo_catu(o, d->level, cap);
+        return;
+    } else {
+        int sub = t->eng != ENG_FM;
+        wo_strcat(o, sub ? (t->eng == ENG_SAW ? "saw" : "square") : "FM", cap);
+        for (i = 0; i < 4; i++) {
+            wo_strcat(o, " ", cap); wo_strcat(o, PSHORT[sub][i], cap); wo_strcat(o, " ", cap);
+            if (!sub && i == 0) wo_strcat(o, RATIOS[t->p[0] % 10], cap); else wo_catu(o, t->p[i], cap);
+        }
+    }
+}
+
+static void draw_seq(void)
+{
+    wo_song_t *s;
+    char b[96], nm[12];
+    int r, st, len, row = sk_row(), ppat = -1, pstep = -1, playing, i;
+    lv_reset();
+    keys_common();
+    s = sk_song();
+    if (!s) {
+        lv_note("No ticket in play. A sketch is kept with its ticket: PLAY starts one.", C(TC_TEXT));
+        lv_note("ENV still plays what you rolled.", C(TC_DIM));
+        F(HB_BTN_PLAY, "start"); F(HB_BTN_ENV, wo_seq_playing() ? "stop" : "play");
+        chrome("SKETCH", " ");
+        lv_draw(-1);
+        return;
+    }
+    playing = wo_seq_pos(&ppat, &pstep, 0, 0);
+    sk.shown = playing ? ppat * 32 + pstep : -1;
+    len = wo_seq_pat_len(s, sk.pat);
+    /* the basics */
+    sk_basics_line(b, 96);
+    clip_text(3, Y0, b, C(TC_DIM), 39);
+    /* the patterns */
+    d_text(3, SK_YPAT, "PAT", C(TC_DIM));
+    for (i = 0; i < SQ_PATS; i++) {
+        char c2[2] = {PATCH[i], 0};
+        int x = SK_GX + i * SK_CW, empty = wo_seq_pat_empty(s, i);
+        if (i == sk.pat) d_rect(x, SK_YPAT - 1, SK_CW - 1, ROWH, C(TC_INK3));
+        d_text(x + 3, SK_YPAT, c2, i == sk.pat ? C(TC_SIGNAL) : empty ? C(TC_DIMMER) : C(TC_TEXT));
+        if (playing && i == ppat) d_rect(x + 1, SK_YPAT + 9, SK_CW - 3, 2, C(TC_CYAN));
+    }
+    if (s->chain_on && s->nchain) { wo_strcpy(b, "chain of ", 32); wo_catu(b, s->nchain, 32); }
+    else { wo_strcpy(b, "loops ", 32); b[6] = PATCH[sk.pat]; b[7] = 0; }
+    d_text_r(237, SK_YPAT, b, C(TC_DIM));
+    /* the ruler: the beats, and where it plays */
+    for (st = 0; st < len; st++) {
+        int x = SK_GX + st * SK_CW;
+        if (st % s->div == 0) { b[0] = 0; wo_catu(b, (uint32_t)(st / s->div + 1), 8); d_text(x + 1, SK_YRUL, b, C(TC_DIMMER)); }
+        if (playing && ppat == sk.pat && pstep == st) d_rect(x + 1, SK_YRUL + 8, SK_CW - 2, 2, C(TC_SIGNAL));
+    }
+    if (sk.rec) d_text_r(237, SK_YRUL, "REC", C(TC_MAGENTA));
+    /* the grid */
+    for (r = 0; r < WO_SEQ_ROWS; r++) {
+        int y = SK_YGRID + r * ROWH, tr = wo_seq_row_track(r), sel = r == row;
+        int muted = s->tr[tr].mute || (r < SQ_LANES && (s->lanemute >> r & 1u));
+        const sq_note_t *n = r < SQ_LANES ? 0 : s->pat[sk.pat].n[r - SQ_LANES];
+        int tail = 0;
+        if (sel) { d_rect(0, y - 1, 240, ROWH, C(TC_INK3)); d_rect(0, y - 1, 2, ROWH, C(TC_SIGNAL)); }
+        if (r == SQ_LANES) d_rect(3, y - 2, 234, 1, C(TC_RULE));
+        d_text(4, y, ROWNAME[r], muted ? C(TC_DIMMER) : sel ? C(TC_SIGNAL) : C(TC_DIM));
+        for (st = 0; st < len; st++) {
+            int x = SK_GX + st * SK_CW + 1, on = 0, held = 0;
+            uint16_t bg = st % s->div == 0 ? C(TC_RULE) : C(TC_INK2), fg = C(TC_INK);
+            char lab[2] = {0, 0};
+            if (r < SQ_LANES) {
+                on = s->pat[sk.pat].hit[r] >> st & 1u;
+                if (on) bg = (s->pat[sk.pat].acc[r] >> st & 1u) ? C(TC_SIGNAL) : C(TC_TEXT);
+            } else if (n[st].note) {
+                int dg;
+                on = 1;
+                bg = tr == TR_BASS ? C(TC_CYAN) : tr == TR_CHORDS ? C(TC_MAGENTA) : C(TC_TEXT);
+                if (tr == TR_CHORDS) lab[0] = (char)('0' + (n[st].note > 9 ? 9 : n[st].note));
+                else { dg = wo_seq_degree(&skb, n[st].note); lab[0] = dg ? (char)('0' + (dg > 9 ? 9 : dg)) : '*'; }
+                tail = n[st].len > 1 ? n[st].len - 1 : 0;
+            } else if (tail > 0) { held = 1; tail--; }
+            if (held) d_rect(x - 1, y + 3, SK_CW, 3, muted ? C(TC_DIMMER) : C(TC_DIM));
+            else {
+                if (on && muted) bg = C(TC_DIMMER);
+                d_rect(x, y, SK_CW - 2, 9, bg);
+                if (lab[0]) d_text(x + 2, y, lab, fg);
+            }
+            if (sel && st == sk.cur) {
+                d_rect(x - 1, y - 1, SK_CW, 1, C(TC_SIGNAL)); d_rect(x - 1, y + 9, SK_CW, 1, C(TC_SIGNAL));
+                d_rect(x - 1, y - 1, 1, 11, C(TC_SIGNAL)); d_rect(x + SK_CW - 2, y - 1, 1, 11, C(TC_SIGNAL));
+            }
+        }
+    }
+    /* the step under the cursor */
+    {
+        int y = SK_YINFO, tr = wo_seq_row_track(row);
+        wo_strcpy(b, "Step ", 96); wo_catu(b, (uint32_t)(sk.cur + 1), 96); wo_strcat(b, " ", 96);
+        wo_strcat(b, ROWNAME[row], 96); wo_strcat(b, ": ", 96);
+        if (row < SQ_LANES) {
+            uint16_t bit = (uint16_t)(1u << sk.cur);
+            wo_strcat(b, (s->pat[sk.pat].hit[row] & bit) ? ((s->pat[sk.pat].acc[row] & bit) ? "hit, accent" : "hit") : "off", 96);
+        } else {
+            const sq_note_t *n = &s->pat[sk.pat].n[row - SQ_LANES][sk.cur];
+            if (!n->note) wo_strcat(b, "off", 96);
+            else {
+                if (tr == TR_CHORDS) wo_strcat(b, n->note - 1 < skb.ch.n ? skb.ch.c[n->note - 1].label : "?", 96);
+                else { wo_seq_note_name(n->note, nm, 12); wo_strcat(b, nm, 96); }
+                wo_strcat(b, "  ", 96); wo_catu(b, n->len, 96); wo_strcat(b, n->len == 1 ? " step" : " steps", 96);
+                wo_strcat(b, "  vel ", 96); wo_catu(b, n->vel, 96);
+            }
+        }
+        clip_text(3, y, b, C(TC_TEXT), 39);
+        sk_track_line(s, row, b, 96);
+        clip_text(3, y + ROWH, b, C(TC_DIM), 39);
+        if (s->nchain) {
+            wo_strcpy(b, s->chain_on ? "CHAIN " : "chain (off) ", 96);
+            for (i = 0; i < s->nchain && wo_strlen(b) < 37; i++) { char c2[3] = {PATCH[s->chain[i] % SQ_PATS], ' ', 0}; wo_strcat(b, c2, 96); }
+        } else wo_strcpy(b, "No chain: it loops the pattern (menu)", 96);
+        clip_text(3, y + 2 * ROWH, b, s->chain_on ? C(TC_CYAN) : C(TC_DIMMER), 39);
+        if (!sk.rec) wo_strcpy(b, "Keys: the steps  PRESETS cursor  ALGO pat", 96);
+        else if (row < SQ_LANES) wo_strcpy(b, "REC: the first 8 keys play the drums", 96);
+        else if (tr == TR_CHORDS) { wo_strcpy(b, "REC: the first ", 96); wo_catu(b, skb.ch.n, 96); wo_strcat(b, " keys play the chords", 96); }
+        else { wo_strcpy(b, "REC: the keys play ", 96); wo_strcat(b, ROWNAME[row], 96); wo_strcat(b, playing ? ", it writes" : ", step by step", 96); }
+        clip_text(3, y + 3 * ROWH, b, sk.rec ? C(TC_MAGENTA) : C(TC_DIMMER), 39);
+        if (row < SQ_LANES) wo_strcpy(b, "K3 accent  K4 swing ", 96);
+        else wo_strcpy(b, "K1 note  K2 len  K3 vel  K4 swing ", 96);
+        wo_catu(b, s->swing, 96);
+        clip_text(3, y + 4 * ROWH, b, C(TC_DIMMER), 39);
+    }
+    K(HB_BTN_SEL, "sound", 0); K(HB_BTN_REC, "rec", 0); K(HB_BTN_ARP, "roll", 0); K(HB_BTN_SEQ, "mutate", 0);
+    K(HB_BTN_LFO, "roll all", 0); K(HB_BTN_EDIT, "mute", 0); K(HB_BTN_ENV, "play", 0);
+    F(HB_BTN_ENV, wo_seq_playing() ? "stop" : "play"); F(HB_BTN_REC, sk.rec ? "rec off" : "rec"); F(HB_BTN_ARP, "roll row");
+    MI("This row", "Roll it", HB_BTN_ARP, 0, 0);
+    MI("This row", "Mutate it", HB_BTN_SEQ, 0, 0);
+    MI("This row", (s->tr[wo_seq_row_track(row)].mute || (row < SQ_LANES && (s->lanemute >> row & 1u))) ? "Unmute it" : "Mute it", HB_BTN_EDIT, 0, 0);
+    MI("This row", "Its sound", HB_BTN_SEL, 0, 0);
+    MI("This row", "Clear it", 0, A_SQ_CLEARROW, 0);
+    MI("Pattern", "Roll the whole pattern", HB_BTN_LFO, 0, 0);
+    MI("Pattern", "Copy it to the next", 0, A_SQ_COPY, 0);
+    MI("Pattern", "Clear it", 0, A_SQ_CLEARPAT, 1);
+    MI("Chain", "Add this pattern to it", 0, A_SQ_CHADD, 0);
+    if (s->nchain) {
+        MI("Chain", "Take the last one off", 0, A_SQ_CHDROP, 0);
+        MI("Chain", s->chain_on ? "Loop this pattern instead" : "Play the chain", 0, A_SQ_CHMODE, 0);
+        MI("Chain", "Clear it", 0, A_SQ_CHCLEAR, 0);
+    }
+    MI("Record", sk.rec ? "Stop recording" : "Record live (REC)", HB_BTN_REC, 0, 0);
+    MI("MIDI", s->clock ? "MIDI clock out: on" : "MIDI clock out: off", 0, A_SQ_CLOCK, 0);
+    { char c2[2] = {PATCH[sk.pat], 0}; wo_strcpy(b, sk.rec ? "SKETCH REC  " : "SKETCH  ", 32); wo_strcat(b, c2, 32); }
+    chrome(b, "");
+}
+
+/* the knobs and buttons on the sketch */
+static void sk_preview(int k, int tr, int note, int vel)
+{
+    sk.kn[k] = 0;
+    if (tr == TR_CHORDS) {
+        int ci = note - 1, i;
+        if (ci < 0 || ci >= skb.ch.n) return;
+        for (i = 0; i < skb.ch.c[ci].npc && i < 6; i++) {
+            int m = 48 + skb.ch.root + skb.ch.c[ci].tone[i];
+            wo_synth_track_note(TR_CHORDS, m, vel);
+            sk.knotes[k][sk.kn[k]++] = (uint8_t)m;
+        }
+    } else { wo_synth_track_note(tr, note, vel); sk.knotes[k][0] = (uint8_t)note; sk.kn[k] = 1; }
+}
+static void sk_release(int k)
+{
+    int i;
+    for (i = 0; i < sk.kn[k]; i++) wo_synth_track_note(TR_BASS, sk.knotes[k][i], 0);
+    sk.kn[k] = 0;
+}
+
+static void seq_key(int k, int down, int vel)
+{
+    wo_song_t *s = sk_song();
+    int row = sk_row(), tr = wo_seq_row_track(row), len, pat, st, pp, ps, fr, playing;
+    if (!s || k < 0 || k > 26) return;
+    if (!vel) vel = 100;
+    if (!down) {
+        if (sk.rec && sk.kstep[k] >= 0 && sk.krow[k] >= SQ_LANES && wo_seq_pos(&pp, &ps, &fr, 0) && pp == sk.kpat[k]) {
+            int l = wo_seq_pat_len(s, pp), held = (ps - sk.kstep[k] + l) % l + (fr >= 128 ? 1 : 0);
+            wo_seq_set_len(s, sk.kpat[k], sk.krow[k], sk.kstep[k], held < 1 ? 1 : held);
+        }
+        sk.kstep[k] = -1;
+        sk_release(k);
+        return;
+    }
+    if (!W.set.sound) { toast("Sound is off (Settings)"); return; }
+    if (!sk.rec) {                                  /* the key is a step */
+        len = wo_seq_pat_len(s, sk.pat);
+        if (k >= len) return;
+        sk.cur = k;
+        if (wo_seq_toggle(s, &skb, sk.pat, row, k)) {
+            if (row < SQ_LANES) wo_synth_drum(row, 100);
+            else sk_preview(k, tr, s->pat[sk.pat].n[row - SQ_LANES][k].note, 100);
+        }
+        sk_changed();
+        return;
+    }
+    /* REC: play it, and write it where it is playing (or at the cursor, when stopped) */
+    {
+        int lane = -1, note = 0, wrow = row;
+        if (row < SQ_LANES) { if (k >= SQ_LANES) return; lane = k; wrow = k; }
+        else if (tr == TR_CHORDS) { if (k >= skb.ch.n) return; note = k + 1; }
+        else { note = wo_synth_snap(k) - (tr == TR_BASS ? 24 : 0); if (note < 24) note += 12; }
+        playing = wo_seq_pos(&pp, &ps, &fr, 0);
+        if (playing) {
+            pat = pp; len = wo_seq_pat_len(s, pat);
+            st = fr < 128 ? ps : (ps + 1) % len;
+            if (st != ps) { if (lane >= 0) wo_seq_skip_drum(lane, st); else wo_seq_skip(tr, st); }
+        } else { pat = sk.pat; len = wo_seq_pat_len(s, pat); st = sk.cur; sk.cur = (sk.cur + 1) % len; }
+        wo_seq_write(s, pat, wrow, st, note, vel);
+        sk.kpat[k] = (int8_t)pat; sk.krow[k] = (int8_t)wrow; sk.kstep[k] = (int8_t)st;
+        if (lane >= 0) wo_synth_drum(lane, vel);
+        else sk_preview(k, tr, note, vel);
+        sk_changed();
+    }
+}
+
+static void seq_event(uint32_t kind, uint32_t id, int32_t arg)
+{
+    wo_song_t *s = sk_song();
+    int row = sk_row(), tr = wo_seq_row_track(row), len;
+    if (!s) return;
+    len = wo_seq_pat_len(s, sk.pat);
+    if (kind == HB_EV_ENC) {
+        int d = arg > 0 ? 1 : arg < 0 ? -1 : 0;
+        switch (id) {
+        case HB_ENC_SELECT: { int r = row + arg; TOP.sel = (int16_t)(r < 0 ? 0 : r >= WO_SEQ_ROWS ? WO_SEQ_ROWS - 1 : r); break; }
+        case HB_ENC_PRESETS: sk.cur = ((sk.cur + arg) % len + len) % len; break;
+        case HB_ENC_ALGORITHM: {
+            int p = sk.pat + d;
+            sk.pat = p < 0 ? 0 : p >= SQ_PATS ? SQ_PATS - 1 : p;
+            wo_seq_edit_pat(sk.pat);
+            if (sk.cur >= wo_seq_pat_len(s, sk.pat)) sk.cur = 0;
+            break; }
+        case HB_ENC_KNOB1: wo_seq_adjust(s, &skb, sk.pat, row, sk.cur, 0, arg); sk_changed();
+            if (row >= SQ_LANES && s->pat[sk.pat].n[row - SQ_LANES][sk.cur].note && W.set.sound) {
+                sk_release(26); sk_preview(26, tr, s->pat[sk.pat].n[row - SQ_LANES][sk.cur].note, 90);
+            }
+            break;
+        case HB_ENC_KNOB2: wo_seq_adjust(s, &skb, sk.pat, row, sk.cur, 1, d); sk_changed(); break;
+        case HB_ENC_KNOB3: wo_seq_adjust(s, &skb, sk.pat, row, sk.cur, 2, d); sk_changed(); break;
+        case HB_ENC_KNOB4: { int w = s->swing + d; s->swing = (uint8_t)(w < 0 ? 0 : w > 10 ? 10 : w); sk_changed(); break; }
+        default: break;
+        }
+        return;
+    }
+    if (kind != HB_EV_BTN_DOWN) return;
+    switch (id) {
+    case HB_BTN_SEL: push(PG_SOUND, (int16_t)row); break;
+    case HB_BTN_REC: sk.rec = !sk.rec; toast(sk.rec ? (wo_seq_playing() ? "Recording: play along" : "Step recording: a key a step") : "Recording off"); break;
+    case HB_BTN_ARP: wo_seq_roll_row(s, &skb, sk.pat, row); sk_changed(); toast("Rolled"); break;
+    case HB_BTN_SEQ: wo_seq_mutate_row(s, &skb, sk.pat, row); sk_changed(); toast("Mutated"); break;
+    case HB_BTN_LFO: wo_seq_roll_pat(s, &skb, sk.pat); sk_changed(); toast("Rolled the pattern"); break;
+    case HB_BTN_EDIT:
+        if (row < SQ_LANES) s->lanemute ^= (uint8_t)(1u << row);
+        else s->tr[tr].mute = !s->tr[tr].mute;
+        sk_changed();
+        break;
+    default: break;
+    }
+}
+
+static void sketch_action(int act)
+{
+    wo_song_t *s = sk_song();
+    int row = sk_row();
+    if (!s) return;
+    switch (act) {
+    case A_SQ_CLEARROW: wo_seq_clear_row(s, sk.pat, row); toast("Row cleared"); break;
+    case A_SQ_CLEARPAT: wo_seq_clear_pat(s, sk.pat); toast("Pattern cleared"); break;
+    case A_SQ_COPY: {
+        int to = wo_seq_copy_next(s, sk.pat);
+        if (to < 0) { toast("H is the last pattern"); return; }
+        sk.pat = to; wo_seq_edit_pat(sk.pat); toast("Copied");
+        break; }
+    case A_SQ_CHADD: if (wo_seq_chain_add(s, sk.pat)) { toast("16 in the chain is the most"); return; } toast("Added to the chain"); break;
+    case A_SQ_CHDROP: wo_seq_chain_drop(s); break;
+    case A_SQ_CHMODE: s->chain_on = !s->chain_on && s->nchain; toast(s->chain_on ? "Plays the chain" : "Loops the pattern"); break;
+    case A_SQ_CHCLEAR: wo_seq_chain_clear(s); toast("Chain cleared"); break;
+    case A_SQ_CLOCK: s->clock = !s->clock; toast(s->clock ? "MIDI clock goes out" : "No MIDI clock"); break;
+    default: return;
+    }
+    sk_changed();
+}
+
+/* ================================================================ SOUND: one track's voice */
+static int sound_rows(int tr) { return tr == TR_DRUMS ? 4 + SQ_LANES : 8; }
+static void draw_sound(void)
+{
+    wo_song_t *s = sk_song();
+    int row = TOP.arg, tr = wo_seq_row_track(row < 0 ? 0 : row), i, n;
+    char b[64], v[24], title[24];
+    lv_reset();
+    keys_common();
+    if (!s) { lv_note("No ticket in play.", C(TC_TEXT)); chrome("SOUND", " "); lv_draw(-1); return; }
+    n = sound_rows(tr);
+    for (i = 0; i < n; i++) {
+        const sq_track_t *t = &s->tr[tr];
+        int sub = t->eng != ENG_FM;
+        v[0] = 0;
+        if (i == 0) { wo_strcpy(b, tr == TR_DRUMS ? "Kit" : "Engine", 64); wo_strcpy(v, ENGNAME[tr == TR_DRUMS][t->eng % ENG_N], 24); }
+        else if (tr != TR_DRUMS && i <= 4) {
+            wo_strcpy(b, PNAME[sub][i - 1], 64);
+            if (!sub && i == 1) wo_strcpy(v, RATIOS[t->p[0] % 10], 24); else wo_catu(v, t->p[i - 1], 24);
+            wo_strcat(b, i == 1 ? " (K1)" : i == 2 ? " (K2)" : i == 3 ? " (K3)" : " (K4)", 64);
+        } else {
+            int k = tr == TR_DRUMS ? i : i - 4;
+            if (k == 1) { wo_strcpy(b, "Volume", 64); wo_catu(v, t->vol, 24); }
+            else if (k == 2) { wo_strcpy(b, "MIDI channel", 64); wo_catu(v, (uint32_t)(t->ch & 15u) + 1u, 24); }
+            else if (k == 3) { wo_strcpy(b, "Mute", 64); wo_strcpy(v, t->mute ? "muted" : "plays", 24); }
+            else {
+                const sq_drum_t *d = &s->dr[k - 4];
+                wo_strcpy(b, ROWNAME[k - 4], 64);
+                wo_strcat(v, "t ", 24); wo_catu(v, d->tune, 24); wo_strcat(v, " d ", 24); wo_catu(v, d->decay, 24);
+                wo_strcat(v, " l ", 24); wo_catu(v, d->level, 24);
+            }
+        }
+        while (wo_strlen(b) + wo_strlen(v) < 37) wo_strcat(b, " ", 64);
+        wo_strcat(b, v, 64);
+        lv_add(i, 6, 0, 0, "", b, TOP.sel == i ? C(TC_SIGNAL) : C(TC_TEXT), C(TC_INK));
+    }
+    lv_note(" ", C(TC_INK));
+    if (tr == TR_DRUMS) lv_note("ALGO changes the highlighted. On a drum: K1 tune, K2 decay, K3 level. The first 8 keys play the drums.", C(TC_DIM));
+    else lv_note("ALGO changes the highlighted. K1 to K4 set the four sound knobs. The keys play it.", C(TC_DIM));
+    {
+        int last, peak;
+        wo_synth_load(&last, &peak);
+        wo_strcpy(b, "Audio load ", 64); wo_catu(b, (uint32_t)last, 64); wo_strcat(b, "%, peak ", 64); wo_catu(b, (uint32_t)peak, 64);
+        wo_strcat(b, "% of the time", 64);
+        lv_note(b, peak > 80 ? C(TC_MAGENTA) : C(TC_DIMMER));
+    }
+    K(HB_BTN_SEL, "hear", 0);
+    F(HB_BTN_SEL, "hear it"); F(HB_BTN_ENV, wo_seq_playing() ? "stop" : "play");
+    wo_strcpy(title, TRNAME[tr], 24); wo_strcat(title, " SOUND", 24);
+    chrome(title, " ");
+    lv_draw(TOP.sel);
+}
+
+static void sound_change(wo_song_t *s, int tr, int i, int d)
+{
+    sq_track_t *t = &s->tr[tr];
+#define CL(v, lo, hi) v = (uint8_t)((int)(v) + d < (lo) ? (lo) : (int)(v) + d > (hi) ? (hi) : (int)(v) + d)
+    if (i == 0) t->eng = (uint8_t)((t->eng + (tr == TR_DRUMS ? 1 : (d > 0 ? 1 : ENG_N - 1))) % (tr == TR_DRUMS ? 2 : ENG_N));
+    else if (tr != TR_DRUMS && i <= 4) { if (i == 1 && t->eng == ENG_FM) CL(t->p[0], 0, 9); else CL(t->p[i - 1], 0, 31); }
+    else {
+        int k = tr == TR_DRUMS ? i : i - 4;
+        if (k == 1) CL(t->vol, 0, 31);
+        else if (k == 2) CL(t->ch, 0, 15);
+        else if (k == 3) t->mute = !t->mute;
+    }
+#undef CL
+    sk_changed();
+}
+static void sound_hear(wo_song_t *s, int tr, int lane)
+{
+    if (!W.set.sound) { toast("Sound is off (Settings)"); return; }
+    if (tr == TR_DRUMS) { wo_synth_drum(lane < 0 ? 0 : lane, 110); return; }
+    sk_release(25);
+    sk_preview(25, tr, tr == TR_CHORDS ? 1 : tr == TR_BASS ? 36 + skb.root : wo_seq_snap(&skb, 60 + skb.root + 7), 100);
+    (void)s;
+}
+static void sound_event(uint32_t kind, uint32_t id, int32_t arg)
+{
+    wo_song_t *s = sk_song();
+    int tr = wo_seq_row_track(TOP.arg < 0 ? 0 : TOP.arg), d = arg > 0 ? 1 : arg < 0 ? -1 : 0, n;
+    if (!s) return;
+    n = sound_rows(tr);
+    if (kind == HB_EV_ENC) {
+        if (id == HB_ENC_ALGORITHM) { sound_change(s, tr, TOP.sel, d); return; }
+        if (tr == TR_DRUMS && TOP.sel >= 4 && TOP.sel < n && id >= HB_ENC_KNOB1 && id <= HB_ENC_KNOB3) {
+            sq_drum_t *dr = &s->dr[TOP.sel - 4];
+            uint8_t *f = id == HB_ENC_KNOB1 ? &dr->tune : id == HB_ENC_KNOB2 ? &dr->decay : &dr->level;
+            int x = *f + d;
+            *f = (uint8_t)(x < 0 ? 0 : x > 31 ? 31 : x);
+            sk_changed();
+            return;
+        }
+        if (tr != TR_DRUMS && id >= HB_ENC_KNOB1 && id <= HB_ENC_KNOB4) { sound_change(s, tr, 1 + (int)(id - HB_ENC_KNOB1), d); return; }
+        return;
+    }
+    if (kind == HB_EV_BTN_DOWN && id == HB_BTN_SEL) sound_hear(s, tr, tr == TR_DRUMS && TOP.sel >= 4 ? TOP.sel - 4 : TOP.arg);
+    if (kind == HB_EV_BTN_UP && id == HB_BTN_SEL) { sk_release(25); }
+}
+static void sound_key(int k, int down, int vel)
+{
+    wo_song_t *s = sk_song();
+    int tr = wo_seq_row_track(TOP.arg < 0 ? 0 : TOP.arg);
+    if (!s || k < 0 || k > 26) return;
+    if (!down) { sk_release(k); return; }
+    if (!W.set.sound) return;
+    if (!vel) vel = 100;
+    if (tr == TR_DRUMS) { if (k < SQ_LANES) wo_synth_drum(k, vel); return; }
+    if (tr == TR_CHORDS) { if (k < skb.ch.n) sk_preview(k, tr, k + 1, vel); return; }
+    sk_preview(k, tr, wo_synth_snap(k) - (tr == TR_BASS ? 24 : 0), vel);
+}
+
+/* ================================================================ ENV: play the sketch */
+static wo_song_t scratch;
+static wo_basics_t scratch_b;
+static void sketch_toggle(void)
+{
+    wo_song_t *s;
+    if (!W.set.sound) { toast("Sound is off (Settings)"); return; }
+    if (wo_seq_playing()) { wo_seq_stop(); toast("Stopped"); return; }
+    if (TOP.page == PG_VIEW) {                              /* a filed ticket's sketch */
+        const wo_ticket_t *t = lib_ticket(TOP.arg);
+        if (!t) return;
+        wo_basics_ticket(t, &scratch_b);
+        scratch = t->song;
+        wo_song_ready(&scratch, &scratch_b);
+        s = &scratch;
+    } else if ((s = sk_song()) != 0) scratch_b = skb;
+    else { wo_basics_draft(&scratch_b); wo_song_seed(&scratch, &scratch_b); s = &scratch; }
+    {
+        int p, any = 0;
+        for (p = 0; p < SQ_PATS; p++) if (!wo_seq_pat_empty(s, p)) any = 1;
+        if (!any) { toast(s == &scratch && !W.has_cur ? "Nothing to play: roll Chords" : "Empty: the keys or ARP put notes in"); return; }
+    }
+    wo_seq_play(s, &scratch_b, s == &scratch ? 0 : sk.pat);
 }
 
 /* ================================================================ SCORES */
@@ -1644,7 +2147,7 @@ static void settings_change(int s, int d)
     case S_CHAOS: W.set.chaos = !W.set.chaos; break;
     case S_HOLDS: W.set.holds = !W.set.holds; break;
     case S_RANCHOR: W.set.ranchor = !W.set.ranchor; break;
-    case S_SOUND: W.set.sound = !W.set.sound; if (!W.set.sound) { wo_synth_stop(); wo_synth_all_off(); } break;
+    case S_SOUND: W.set.sound = !W.set.sound; if (!W.set.sound) { wo_seq_stop(); wo_synth_all_off(); } break;
     case S_VOL: { int t = W.set.volume + d; W.set.volume = (uint8_t)(t < 0 ? 0 : t > 10 ? 10 : t); wo_synth_volume(W.set.volume); break; }
     default: return;
     }
@@ -1656,7 +2159,7 @@ static void settings_event(uint32_t kind, uint32_t id, int32_t arg)
     if (kind == HB_EV_ENC && (id == HB_ENC_ALGORITHM || id == HB_ENC_KNOB1)) { settings_change(TOP.sel, arg > 0 ? 1 : -1); return; }
     if (kind == EV_HOLD && id == HB_BTN_FX) {
         if (TOP.sel == S_RESETW) { wo_reset_weights(); wo_store_mark(ST_STATE); toast("Learning reset"); }
-        else if (TOP.sel == S_WIPE) { wo_synth_stop(); wo_store_wipe(); go_root(PG_HOME); toast("Everything reset"); }
+        else if (TOP.sel == S_WIPE) { wo_seq_stop(); wo_store_wipe(); go_root(PG_HOME); toast("Everything reset"); }
         return;
     }
     if (kind == HB_EV_BTN_DOWN && id == HB_BTN_SEL) {
@@ -1671,7 +2174,9 @@ static void settings_event(uint32_t kind, uint32_t id, int32_t arg)
 /* ================================================================ HELP */
 static const char *const HELP[] = {
     "The menu", "GLO opens a menu of everything the page can do, in groups, with the button that does it straight away on the right. SELECT moves, SCL runs it, HOME closes. The bottom line names the page's three main buttons.",
-    "Everywhere", "SELECT moves, PRESETS moves faster. SCL opens or ticks. HOME goes back (hold it to leave WORKORDER). ENV plays the rolled chords. The keys play the rolled scale; OCT- / OCT+ shift them.",
+    "Everywhere", "SELECT moves, PRESETS moves faster. SCL opens or ticks. HOME goes back (hold it to leave WORKORDER). ENV plays or stops the sketch. The keys play the rolled scale; OCT- / OCT+ shift them.",
+    "The sketch", "Drums (8), bass, chords and lead, a bar a pattern, in the ticket's key, tempo, meter and chords. SELECT picks a row, the keys are its steps, PRESETS moves the cursor, ALGO the pattern A to H. K1 note, K2 length, K3 velocity (accent on a drum), K4 swing. REC plays along and writes it. ARP rolls a row, LFO the pattern, SEQ mutates. SCL: the row's sound.",
+    "Chain and MIDI", "The menu adds patterns to the chain, which ENV plays in order; without one, the pattern loops. Notes go out over USB MIDI: bass 1, chords 2, lead 3, drums 10 (change it on the sound page), with MIDI clock. The newest 4 filed tickets keep their sketch.",
     "Starting", "PLAY with no ticket rolls your setup and starts the clock. To tweak first, open Roll: REC rolls everything, ARP rerolls one parameter, SEQ mutates, LFO rolls at random, EDIT switches a parameter, SAVE holds it. Then PLAY.",
     "Working", "SCL ticks a rule off. FX breaks it (say why) or unbreaks it. PLAY pauses the clock, SAVE parks the ticket. Finishing, rating and retiring a rule for good are in the menu.",
     "For good", "Anything that can't be undone (finishing, retiring, deleting, resets) is in the menu, and asks first: SCL yes, HOME no.",
@@ -1742,28 +2247,60 @@ static void ev_none(uint32_t k, uint32_t i, int32_t a) { (void)k; (void)i; (void
 
 static const draw_fn DRAW[PG_N] = {draw_home, draw_roll, draw_field, draw_session, draw_rate, draw_modes, draw_parked,
                                    draw_library, draw_view, draw_scores, draw_rules, draw_gear, draw_buckets, draw_mats,
-                                   draw_presets, draw_settings, draw_help, draw_gloss, draw_text_page};
+                                   draw_presets, draw_settings, draw_help, draw_gloss, draw_text_page, draw_seq, draw_sound};
 static const event_fn EVENT[PG_N] = {home_event, roll_event, field_event, session_event, rate_event, modes_event,
                                      parked_event, library_event, view_event, scores_event, rules_event, gear_event,
-                                     buckets_event, mats_event, presets_event, settings_event, ev_none, ev_none, ev_none};
+                                     buckets_event, mats_event, presets_event, settings_event, ev_none, ev_none, ev_none,
+                                     seq_event, sound_event};
 
 /* LEDs: the buttons that do something on this page glow, the keys of the rolled scale glow */
-static uint32_t leds_shown = 0xFFFFFFFFu, keys_shown = 0xFFFFFFFFu;
+static uint32_t leds_shown = 0xFFFFFFFFu, keys_shown = 0xFFFFFFFFu, keys_lit_shown = 0xFFFFFFFFu;
+/* the sketch's keys: the steps (lit: on, glowing: off; the step playing turns over), or what REC plays */
+static void sk_leds(uint32_t *lit, uint32_t *glow)
+{
+    const wo_song_t *s = &W.cur.song;
+    int row = sk_row(), tr = wo_seq_row_track(row), len, st, pp, ps, i;
+    if (!s->div) return;
+    if (sk.rec) {
+        if (row < SQ_LANES) *glow = 0xFFu;
+        else if (tr == TR_CHORDS) *glow = (1u << skb.ch.n) - 1u;
+        else for (i = 0; i < 27; i++) if (wo_synth_in_scale(i)) *glow |= 1u << i;
+        return;
+    }
+    len = wo_seq_pat_len(s, sk.pat);
+    for (st = 0; st < len; st++) {
+        int on = row < SQ_LANES ? (s->pat[sk.pat].hit[row] >> st & 1u) : !!s->pat[sk.pat].n[row - SQ_LANES][st].note;
+        if (on) *lit |= 1u << st; else *glow |= 1u << st;
+    }
+    if (wo_seq_pos(&pp, &ps, 0, 0) && pp == sk.pat && ps < len) { *lit ^= 1u << ps; *glow ^= 1u << ps; }
+}
 static void leds(void)
 {
-    uint32_t b = 0, k = 0, i;
+    uint32_t b = 0, k = 0, lit = 0, i, extra;
     for (i = 0; i < 12; i++) if (key_tap[i] && key_tap[i][0]) b |= 1u << (i + 2);
     if (menu_open || conf_open) b = (1u << HB_BTN_SEL) | (1u << HB_BTN_HOME) | (1u << HB_BTN_GLO);
+    sync_scale();
     if (TOP.page == PG_TEXT) { b |= 3u; k = 0x7FFFFFFu; }
-    else {
-        sync_scale();
-        for (i = 0; i < 27; i++) if (wo_synth_in_scale((int)i)) k |= 1u << i;
+    else if (TOP.page == PG_SEQ && W.has_cur) sk_leds(&lit, &k);
+    else if (TOP.page == PG_SOUND && W.has_cur) {
+        int tr = wo_seq_row_track(TOP.arg < 0 ? 0 : TOP.arg);
+        if (tr == TR_DRUMS) k = 0xFFu;
+        else if (tr == TR_CHORDS) k = (1u << skb.ch.n) - 1u;
+        else for (i = 0; i < 27; i++) if (wo_synth_in_scale((int)i)) k |= 1u << i;
+    } else for (i = 0; i < 27; i++) if (wo_synth_in_scale((int)i)) k |= 1u << i;
+    extra = (wo_seq_playing() ? 1u << 20 : 0u) | (TOP.page == PG_SEQ && sk.rec ? 1u << 21 : 0u);
+    if ((b | extra) != leds_shown) {
+        for (i = 0; i < 14; i++) {
+            uint32_t on = (b >> i & 1u) ? 2u : 0u;
+            if (on && ((i == HB_BTN_ENV && (extra >> 20 & 1u)) || (i == HB_BTN_REC && (extra >> 21 & 1u)))) on = 1u;
+            H->led(i, on);
+        }
+        leds_shown = b | extra;
     }
-    if (b != leds_shown) {
-        for (i = 0; i < 14; i++) H->led(i, (b >> i & 1u) ? ((i == HB_BTN_ENV && wo_synth_playing()) ? 1u : 2u) : 0u);
-        leds_shown = b;
+    if (k != keys_shown || lit != keys_lit_shown) {
+        for (i = 0; i < 27; i++) H->led(HB_LED_KEY(i), (lit >> i & 1u) ? 1u : (k >> i & 1u) ? 2u : 0u);
+        keys_shown = k; keys_lit_shown = lit;
     }
-    if (k != keys_shown) { for (i = 0; i < 27; i++) H->led(HB_LED_KEY(i), (k >> i & 1u) ? 2u : 0u); keys_shown = k; }
 }
 
 static int page_has_menu(void) { return TOP.page != PG_TEXT && TOP.page != PG_GLOSS && TOP.page != PG_RATE; }
@@ -1771,7 +2308,7 @@ static int page_has_menu(void) { return TOP.page != PG_TEXT && TOP.page != PG_GL
 /* the keys the module handles itself, before the page: ENV, PLAY, OCT-, OCT+, HOME */
 static int global_tap(uint32_t id)
 {
-    if (id == HB_BTN_ENV) { chords_toggle(); return 1; }
+    if (id == HB_BTN_ENV) { sketch_toggle(); return 1; }
     if (id == HB_BTN_PLAY) {
         if (!W.has_cur) quick_start();
         else { wo_pause(); W.cur.powered_off = 0; wo_store_mark(ST_CUR); toast(W.cur.running ? "Clock running" : "Paused"); }
@@ -1800,17 +2337,20 @@ static void run_item(mi_t m, int confirmed)
     switch (m.act) {
     case A_FINISH: if (W.has_cur) { push(PG_RATE, 0); TOP.sel = 1; } break;
     case A_PARK: {
-        int r = wo_park();
+        int r;
+        wo_seq_stop();
+        r = wo_park();
         toast(r == 0 ? "Ticket parked" : r == -1 ? "Both park slots are taken" : "Could not save it");
         if (!r) go_root(PG_HOME);
         break; }
     case A_FORGOOD: EVENT[p](EV_HOLD, HB_BTN_FX, 0); break;
     case A_RESETW: wo_reset_weights(); wo_store_mark(ST_STATE); toast("Learning reset"); break;
-    case A_WIPE: wo_synth_stop(); wo_store_wipe(); go_root(PG_HOME); toast("Everything reset"); break;
+    case A_WIPE: wo_seq_stop(); wo_store_wipe(); go_root(PG_HOME); toast("Everything reset"); break;
     case A_HOMEPAGE: go_root(PG_HOME); break;
     case A_HELP: push(PG_HELP, 0); break;
     case A_GLOSS: EVENT[p](HB_EV_BTN_DOWN, HB_BTN_GLO, 0); break;
-    default: break;
+    case A_SKETCH: push(PG_SEQ, 0); break;
+    default: if (m.act >= A_SQ_CLEARROW) sketch_action(m.act); break;
     }
 }
 
@@ -1823,6 +2363,9 @@ void wo_ui_init(const hb_host_t *h)
     need_full = 1; leds_shown = keys_shown = 0xFFFFFFFFu;
     menu_open = conf_open = 0;
     wo_synth_volume(W.set.volume);
+    { int k; for (k = 0; k < 27; k++) sk.kstep[k] = -1; }
+    sk.pat = 0; sk.cur = 0; sk.rec = 0; sk.shown = -1;
+    wo_synth_song(W.has_cur ? &W.cur.song : 0);
     sync_scale();
 }
 
@@ -1837,8 +2380,11 @@ void wo_ui_event(uint32_t ev, int32_t arg)
         return;
     }
     if (kind == HB_EV_KEY_DOWN || kind == HB_EV_KEY_UP) {
-        if (W.set.sound) { sync_scale(); wo_synth_key((int)id, kind == HB_EV_KEY_DOWN, arg); }
+        sync_scale();
+        if (p == PG_SEQ && W.has_cur && !menu_open && !conf_open) { seq_key((int)id, kind == HB_EV_KEY_DOWN, arg); return; }
         need_full = 0;
+        if (p == PG_SOUND && W.has_cur) { sound_key((int)id, kind == HB_EV_KEY_DOWN, arg); return; }
+        if (W.set.sound) wo_synth_key((int)id, kind == HB_EV_KEY_DOWN, arg);
         return;
     }
     if (conf_open) {                            /* "Sure?": SCL yes, HOME (or GLO) no */
@@ -1858,6 +2404,7 @@ void wo_ui_event(uint32_t ev, int32_t arg)
         if (kind == HB_EV_BTN_DOWN && id != HB_BTN_HOME) menu_open = 0;   /* another button: its shortcut, as usual */
         else return;
     }
+    if (p == PG_SEQ && kind == HB_EV_ENC) { EVENT[p](kind, id, arg); return; }   /* the sketch's knobs are its own */
     if (kind == HB_EV_ENC && (id == HB_ENC_SELECT || id == HB_ENC_PRESETS)) {
         int n = lv_entries(), s = TOP.sel + (id == HB_ENC_PRESETS ? arg * 4 : arg);
         if (n <= 0) { TOP.scroll = (int16_t)(TOP.scroll + arg); if (TOP.scroll < 0) TOP.scroll = 0; return; }
@@ -1884,7 +2431,8 @@ void wo_ui_event(uint32_t ev, int32_t arg)
 void wo_ui_draw(uint32_t full)
 {
     uint32_t t = H->ms();
-    wo_synth_poll(t);
+    wo_synth_midi(H->midi_send);
+    wo_synth_song(W.has_cur ? &W.cur.song : 0);
     if (toast_until && t >= toast_until) { toast_until = 0; need_full = 1; }
     if (full) need_full = 1;
     if (need_full) {
@@ -1914,13 +2462,31 @@ void wo_ui_draw(uint32_t full)
         flush_rows(0, HDR_H);
         if (last_clock_s % 300u == 0u) wo_store_mark(ST_CUR);     /* the clock, every five minutes */
     }
-    wo_store_poll(!wo_synth_busy());
+    if (TOP.page == PG_SEQ && W.has_cur && !need_full && !menu_open && !conf_open) {
+        int pp, ps, pos = wo_seq_pos(&pp, &ps, 0, 0) ? pp * 32 + ps : -1;
+        if (pos != sk.shown) {                  /* the step moved on: the pattern row, the ruler, the keys */
+            int i, keep = 0;
+            nops = 0; tpos = 0;
+            DRAW[TOP.page]();
+            for (i = 0; i < nops; i++) if (ops[i].y >= SK_YPAT - 1 && ops[i].y + ops[i].h <= SK_YGRID - 1) ops[keep++] = ops[i];
+            nops = keep;
+            flush_rows(SK_YPAT - 1, SK_YGRID - 1);
+            leds();
+        }
+    }
+    wo_store_poll(!wo_synth_busy(), wo_seq_playing() ? 120000u : 20000u);
+    if (wo_store_song_dropped()) toast("The sketch didn't fit: the ticket was saved without it");
     if (wo_store_failed()) toast("Storage full: some of it was not saved");
 }
 
 void wo_ui_release(void)
 {
-    wo_synth_stop();
+    if (wo_seq_playing() && W.has_cur && W.cur.song.div && H->midi_send) {    /* render() stops now: say so to MIDI */
+        int t;
+        for (t = 0; t < TR_N; t++) H->midi_send(0xB0u | (W.cur.song.tr[t].ch & 15u), 123, 0);
+        if (W.cur.song.clock) H->midi_send(0xFCu, 0, 0);
+    }
+    wo_seq_stop();
     wo_synth_all_off();
     wo_store_flush();
 }

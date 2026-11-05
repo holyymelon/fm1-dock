@@ -41,12 +41,14 @@ static int init(const hb_host_t *h)
     WB.save = bank_save;
     wo_seed(h->rand() ^ (h->ticks() << 7));
     wo_defaults();
+    wo_synth_init();
+    wo_synth_ticks(h->ticks);
     wo_store_load_all();
     wo_ui_init(h);
     return 0;
 }
 
-static void release(void) { wo_ui_release(); }
+static void release(void) { wo_ui_release(); wo_synth_midi(H->midi_send); }
 
 static void note(uint32_t ch, uint32_t key, uint32_t vel)
 {
