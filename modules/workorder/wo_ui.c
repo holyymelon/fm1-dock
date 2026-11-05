@@ -1396,7 +1396,7 @@ static void draw_seq(void)
             for (i = 0; i < s->nchain && wo_strlen(b) < 37; i++) { char c2[3] = {PATCH[s->chain[i] % SQ_PATS], ' ', 0}; wo_strcat(b, c2, 96); }
         } else wo_strcpy(b, "No chain: it loops the pattern (menu)", 96);
         clip_text(3, y + 2 * ROWH, b, s->chain_on ? C(TC_CYAN) : C(TC_DIMMER), 39);
-        if (!sk.rec) wo_strcpy(b, "Keys: the steps  PRESETS cursor  ALGO pat", 96);
+        if (!sk.rec) wo_strcpy(b, "Keys: steps, PRESETS: cursor, ALGO: A-H", 96);
         else if (row < SQ_LANES) wo_strcpy(b, "REC: the first 8 keys play the drums", 96);
         else if (tr == TR_CHORDS) { wo_strcpy(b, "REC: the first ", 96); wo_catu(b, skb.ch.n, 96); wo_strcat(b, " keys play the chords", 96); }
         else { wo_strcpy(b, "REC: the keys play ", 96); wo_strcat(b, ROWNAME[row], 96); wo_strcat(b, playing ? ", it writes" : ", step by step", 96); }
